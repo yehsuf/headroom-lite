@@ -14,7 +14,7 @@ const FILE_SPAN = [
 ].join('\n');
 
 describe('cross-turn dedup', () => {
-  it('folds a repeated multi-line tool span into an earlier-turn pointer', () => {
+  it('folds a repeated multi-line tool span into a 1-based earlier-turn pointer', () => {
     const blocks = [
       { turn: 12, text: `cat src/auth/login.mjs\n${FILE_SPAN}\n# eof` },
       { turn: 13, text: `sed -n '1,8p' src/auth/login.mjs\n${FILE_SPAN}\n# done` },
@@ -23,7 +23,7 @@ describe('cross-turn dedup', () => {
     const result = dedupBlocks(blocks);
 
     assert.equal(result.blocks[0].text, blocks[0].text);
-    assert.match(result.blocks[1].text, /\[myelin: 8 lines identical to output shown earlier \(turn 12, lines 1-8\)/);
+    assert.match(result.blocks[1].text, /\[myelin: 8 lines identical to output shown earlier \(turn 12, lines 2-9\)/);
     assert.match(result.blocks[1].text, /starts: "export async function login/);
     assert.equal(result.stats.spansFolded, 1);
     assert.equal(result.stats.linesRemoved, 8);
