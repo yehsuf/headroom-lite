@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from .backends import StubBackend, get_backend
@@ -130,7 +130,7 @@ def main(argv=None):
     _backend_name = args.backend
     _model_name = args.model
 
-    server = HTTPServer((args.host, args.port), _Handler)
+    server = ThreadingHTTPServer((args.host, args.port), _Handler)
     log.info('headroom-lingua-service listening on %s:%d (backend=%s)',
              args.host, args.port, _backend_name)
     try:

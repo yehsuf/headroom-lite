@@ -6,7 +6,7 @@ import http.client
 import json
 import socket
 import threading
-from http.server import HTTPServer
+from http.server import ThreadingHTTPServer
 
 import pytest
 
@@ -160,7 +160,7 @@ def _test_server(backend='stub', model_name=None):
     svc._backend_instance = None
     svc._model_loaded = False
 
-    server = HTTPServer(('127.0.0.1', port), svc._Handler)
+    server = ThreadingHTTPServer(('127.0.0.1', port), svc._Handler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     try:
