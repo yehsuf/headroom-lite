@@ -15,7 +15,8 @@ const ANSI_RE = /\x1b\[[0-9;]*m/;
 const LOG_HINT_RE = /(?:^|\n)(?:info|warn|error|debug|trace)\b/i;
 
 const NEVER_LOSSY_ROLES = new Set(['system', 'developer']);
-const SKIP_SUBTREES = new Set(['cache_control', 'signature']);
+const SKIP_MUTATION_KEYS = new Set(['arguments', 'input', 'partial_json', 'input_json']);
+const SKIP_SUBTREES = new Set(['cache_control', 'signature', ...SKIP_MUTATION_KEYS]);
 const SKIP_TEXT_KEYS = new Set([
   'role',
   'type',
@@ -29,7 +30,6 @@ const SKIP_TEXT_KEYS = new Set([
   'status',
   'mime_type',
 ]);
-const SKIP_MUTATION_KEYS = new Set(['arguments', 'input', 'partial_json', 'input_json']);
 const SAFE_TEXT_KEYS = new Set([
   'content',
   'text',
@@ -120,6 +120,11 @@ function createLeaf(parent, key, { messageIndex, role, parentKey }) {
   };
 }
 
+function hasSignedSiblingFields(node) {
+  // Signed content blocks must remain byte-exact; skip unexpected signed shapes too.
+  return Object.hasOwn(node, 'signature');
+}
+
 function walkNode(node, context, leaves, parent = null, key = null) {
   if (typeof node === 'string') {
     if (parent !== null && shouldVisitText(node, key, context.parentKey)) {
@@ -136,6 +141,8 @@ function walkNode(node, context, leaves, parent = null, key = null) {
   }
 
   if (node && typeof node === 'object') {
+    if (hasSignedSiblingFields(node)) return;
+
     const nextRole = typeof node.role === 'string' ? normalizeRole(node.role) : context.role;
 
     for (const [childKey, childValue] of Object.entries(node)) {
