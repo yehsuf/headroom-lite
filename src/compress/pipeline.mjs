@@ -9,6 +9,7 @@ import { computeFrozenCount } from './frozen-prefix.mjs';
 import { minifyJson } from './json-minifier.mjs';
 import { compactLossless } from './lossless-compaction.mjs';
 import { withTagProtection } from './tag-protector.mjs';
+import { compactToolOutputs } from './tool-output-compactor.mjs';
 import { estimateMessageTokens } from '../lib/estimate-tokens.mjs';
 
 const SEARCH_ROW_RE = /^[^\n:]+:\d+:.*$/m;
@@ -238,13 +239,18 @@ export function compressMessages(messages, { format = 'anthropic', model = 'defa
   const tokensBefore = estimateMessageTokens(messages);
 
   const outputLive = structuredClone(live);
+
+  // Phase 1: compact JSON arrays in tool_result blocks (before text leaf walk
+  // so the resulting CSV strings are not re-processed by lossless compaction).
+  const latestMessageIndex = outputLive.length - 1;
+  compactToolOutputs(outputLive, latestMessageIndex);
+
   const leaves = collectTextLeaves(outputLive);
 
   for (const leaf of leaves) {
     leaf.set(compactMessageText(leaf.get()));
   }
 
-  const latestMessageIndex = outputLive.length - 1;
   const lossyCandidates = leaves.filter((leaf) => isLossyEligibleLeaf(leaf, latestMessageIndex, compressLive));
 
   if (lossyCandidates.length >= 2) {
