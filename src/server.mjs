@@ -5,6 +5,7 @@ import { detectVolatileContent } from './analyze/volatile-detector.mjs';
 import { proxyRequest, resolveUpstream, resolveProxyTimeoutMs } from './proxy.mjs';
 import { parseIntOption } from './lib/config.mjs';
 import { DriftDetector } from './analyze/drift-detector.mjs';
+import { injectOpenAICacheKey, resolveOpenAICacheKey } from './normalize/openai-cache-key.mjs';
 
 const driftDetector = new DriftDetector();
 
@@ -89,6 +90,14 @@ async function handleCompress(request, response, { maxBodyBytes }) {
   };
   if (normalizedTools !== undefined) responseBody.normalized_tools = normalizedTools;
   if (warnings.length > 0) responseBody.warnings = warnings;
+
+  // OpenAI prompt_cache_key injection for OpenAI-format requests
+  if (payload.format === 'openai' && resolveOpenAICacheKey()) {
+    const injected = injectOpenAICacheKey(payload);
+    if (injected.prompt_cache_key != null) {
+      responseBody.prompt_cache_key = injected.prompt_cache_key;
+    }
+  }
 
   // Cache drift detection — only when caller provides a valid session_id (max 256 chars)
   if (typeof payload.session_id === 'string' && payload.session_id.length > 0 &&
