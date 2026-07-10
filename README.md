@@ -196,6 +196,27 @@ Readiness-style JSON response. Includes `upstreams` map (all four slots) and `co
 
 Liveness-style JSON response.
 
+## Lossy Compression (Optional)
+
+headroom-lite ships an optional lossy compression stage powered by
+[LLMLingua-2](https://github.com/microsoft/LLMLingua). When enabled, a
+separate Python microservice (`headroom-lingua-service`) classifies and
+removes low-information tokens from message history — applied only to
+content outside the frozen cache prefix, so cached tokens are never touched.
+
+Lossless compression (dedup, tool-output compaction, JSON minification) always
+runs first. Lossy compression is strictly opt-in:
+
+```bash
+# Start the Python service (separate process)
+python -m headroom_lingua_service --port 8791 --backend llmlingua2
+
+# Enable in headroom-lite
+HEADROOM_LITE_LOSSY=1 node src/server.mjs
+```
+
+Full guide, env reference, and macOS launchd setup: **[docs/llmlingua.md](./docs/llmlingua.md)**
+
 ## Development
 
 Run tests:
