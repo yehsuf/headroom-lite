@@ -379,7 +379,9 @@ export async function compressMessagesAsync(messages, {
   return {
     messages: resultMessages,
     tokensBefore: deterministic.tokensBefore,
-    tokensAfter: deterministic.tokensAfter, // conservative — not re-estimated
+    tokensAfter: applied > 0
+      ? estimateMessageTokens(resultMessages)
+      : deterministic.tokensAfter,
     frozenCount: deterministic.frozenCount ?? 0,
     lossy: {
       enabled: true,

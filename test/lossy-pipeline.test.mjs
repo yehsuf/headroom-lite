@@ -239,3 +239,49 @@ describe('compressMessagesAsync', () => {
     assert.equal(out.lossy.rejected, 1);
   });
 });
+
+// ── Fix test: tokensAfter re-estimated when lossy applied ─────────────────
+
+
+describe('compressMessagesAsync — CR fix: tokensAfter re-estimated', () => {
+  it('tokensAfter < tokensBefore when lossy was applied', async () => {
+    const bigText = 'The quick brown fox jumps over the lazy dog. '.repeat(30);
+    const compressed = 'Fox jumps dog.'; // much shorter
+    const messages = [
+      { role: 'user', content: bigText },
+      { role: 'user', content: 'latest message' },
+    ];
+    const lossy = {
+      enabled: true,
+      serviceUrl: 'http://unused',
+      backend: 'stub',
+      modelName: 'stub',
+      targetRate: 0.5,
+      timeoutMs: 5000,
+      minChars: 10,
+      maxChars: 60000,
+      maxBatchChars: 120000,
+      failClosed: false,
+      compressCode: false,
+      // Inject a mock fetch for this test
+      _mockFetch: async () => ({
+        ok: true,
+        json: async () => ({
+          items: [{ id: 'm0:text', text: compressed, compressed: true,
+                    originalChars: bigText.length, compressedChars: compressed.length }],
+        }),
+      }),
+    };
+    // Patch global fetch for the duration of this test
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = lossy._mockFetch;
+    try {
+      const result = await compressMessagesAsync(messages, { lossy, compressLive: false });
+      assert.ok(result.lossy.applied > 0, 'expected at least 1 applied');
+      assert.ok(result.tokensAfter < result.tokensBefore,
+        `tokensAfter (${result.tokensAfter}) should be < tokensBefore (${result.tokensBefore})`);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});

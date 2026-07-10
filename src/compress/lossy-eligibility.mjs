@@ -40,9 +40,17 @@ export function collectLossyCandidates(messages, {
     if (!msg || typeof msg !== 'object') continue;
     if (!compressLive && msgIdx === latestIdx) continue;
     if (msg.role === 'system' || msg.role === 'developer') continue;
+    // OpenAI tool/function responses carry their payload as a top-level content
+    // string. Lossy rewriting would corrupt tool-chain correctness (the assistant
+    // parses tool output on the next turn). Exclude them explicitly.
+    if (msg.role === 'tool' || msg.role === 'function') continue;
 
     const content = msg.content;
     if (typeof content === 'string') {
+      // Skip oversized content: we only send a truncated slice to the service,
+      // but on apply we'd replace the FULL content — silently discarding the tail.
+      // Reject rather than corrupt.
+      if (content.length > maxChars) continue;
       if (content.length >= minChars) {
         const kind = classifyTextKind(content);
         if (_isEligibleKind(kind, compressCode)) {
@@ -67,7 +75,8 @@ export function collectLossyCandidates(messages, {
         // Only process text-shaped blocks
         if (blockType !== 'text' && blockType !== '') continue;
         const text = block.text;
-        if (typeof text !== 'string' || text.length < minChars) continue;
+        // Skip both too-short and too-large blocks (same corruption guard as string branch)
+        if (typeof text !== 'string' || text.length < minChars || text.length > maxChars) continue;
         if (SKIP_KEYS.has(blockType)) continue;
         const kind = classifyTextKind(text);
         if (_isEligibleKind(kind, compressCode)) {

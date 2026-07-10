@@ -141,3 +141,65 @@ describe('collectLossyCandidates', () => {
     assert.equal(candidates[0].contentIdx, 1);
   });
 });
+
+// ── Fix tests: role:tool exclusion + oversized truncation guard ───────────
+
+describe('collectLossyCandidates — CR fix: OpenAI role:tool excluded', () => {
+  it('skips role=tool messages (OpenAI tool responses)', () => {
+    const toolContent = longProse('tool output ');
+    const messages = [
+      { role: 'tool', content: toolContent },
+      { role: 'user', content: 'latest' },
+    ];
+    const candidates = collectLossyCandidates(messages, { compressLive: false });
+    assert.equal(candidates.length, 0, 'role:tool must never be a candidate');
+  });
+
+  it('skips role=function messages (legacy OAI function responses)', () => {
+    const messages = [
+      { role: 'function', content: longProse('fn ') },
+      { role: 'user', content: 'latest' },
+    ];
+    assert.equal(collectLossyCandidates(messages).length, 0);
+  });
+
+  it('still includes role=assistant prose of same length', () => {
+    const messages = [
+      { role: 'assistant', content: longProse('asst ') },
+      { role: 'user', content: 'latest' },
+    ];
+    assert.ok(collectLossyCandidates(messages).length > 0);
+  });
+});
+
+describe('collectLossyCandidates — CR fix: oversized truncation guard', () => {
+  it('skips string content > maxChars to prevent silent tail discard', () => {
+    const oversized = 'x'.repeat(5000);
+    const messages = [
+      { role: 'user', content: oversized },
+      { role: 'user', content: 'latest' },
+    ];
+    const candidates = collectLossyCandidates(messages, { minChars: 100, maxChars: 1000 });
+    assert.equal(candidates.length, 0, 'oversized string must be skipped, not truncated');
+  });
+
+  it('skips content block text > maxChars', () => {
+    const messages = [
+      { role: 'assistant', content: [{ type: 'text', text: 'x'.repeat(5000) }] },
+      { role: 'user', content: 'latest' },
+    ];
+    const candidates = collectLossyCandidates(messages, { minChars: 100, maxChars: 1000 });
+    assert.equal(candidates.length, 0);
+  });
+
+  it('includes content at exactly maxChars boundary', () => {
+    const exactly = longProse('x ');
+    const messages = [
+      { role: 'user', content: exactly },
+      { role: 'user', content: 'latest' },
+    ];
+    const len = exactly.length;
+    const candidates = collectLossyCandidates(messages, { minChars: 100, maxChars: len });
+    assert.equal(candidates.length, 1, 'content at exactly maxChars should be included');
+  });
+});
