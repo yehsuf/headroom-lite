@@ -4,7 +4,9 @@ import {
   DEFAULT_MIN_LINES,
   dedupBlocks,
 } from './cross-turn-dedup.mjs';
+import { filterDiffNoise } from './diff-noise-filter.mjs';
 import { computeFrozenCount } from './frozen-prefix.mjs';
+import { minifyJson } from './json-minifier.mjs';
 import { compactLossless } from './lossless-compaction.mjs';
 import { withTagProtection } from './tag-protector.mjs';
 import { estimateMessageTokens } from '../lib/estimate-tokens.mjs';
@@ -79,7 +81,16 @@ function detectPrimaryCompactionKind(text) {
 }
 
 export function compactMessageText(text) {
-  return withTagProtection(text, (safeText) => {
+  // Pre-process: filter diff noise before compaction (avoids compacting lockfile noise)
+  let processed = detectPrimaryCompactionKind(text) === 'diff'
+    ? filterDiffNoise(text)
+    : text;
+
+  // Pre-process: JSON minification (removes whitespace before lossless compaction)
+  processed = minifyJson(processed);
+
+  // Wrap the compaction steps with tag protection so XML-like tags are never mutated
+  return withTagProtection(processed, (safeText) => {
     let output = safeText;
     const primaryKind = detectPrimaryCompactionKind(safeText);
     if (primaryKind !== null) output = compactLossless(output, primaryKind);
