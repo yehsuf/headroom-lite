@@ -78,14 +78,61 @@ class LLMLingua2Backend:
 
 
 class SecurityLinguaBackend:
-    """SecurityLingua backend. Placeholder — implemented in PR4."""
-    def __init__(self, model_name: str = 'microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank'):
+    """SecurityLingua backend for security-aware prompt compression.
+
+    Uses SecurityLingua/securitylingua-xlm-s2s model to extract the "intention"
+    from potentially adversarial prompts. Particularly effective at stripping
+    jailbreak scaffolding while preserving the core request.
+
+    Requires git install (not available in PyPI llmlingua 0.2.2):
+        pip install git+https://github.com/microsoft/LLMLingua.git
+
+    Model size: ~2.1 GiB (XLM-RoBERTa-large). Much larger than llmlingua2
+    BERT-base (~677 MiB). Cold-start is significantly slower.
+    """
+
+    def __init__(self, model_name: str = 'SecurityLingua/securitylingua-xlm-s2s'):
         self._model_name = model_name
-        self._model = None
-        self._lock = threading.Lock()
+        self._compressor = None
+        self._load_lock = threading.Lock()
+        self._compress_lock = threading.Lock()
+
+    def load(self) -> None:
+        """Explicitly pre-warm the model. Called once at service startup if desired."""
+        if self._compressor is None:
+            with self._load_lock:
+                if self._compressor is None:
+                    try:
+                        from llmlingua import PromptCompressor
+                    except ImportError as e:
+                        raise RuntimeError(
+                            'SecurityLingua requires git install: '
+                            'pip install git+https://github.com/microsoft/LLMLingua.git'
+                        ) from e
+                    self._compressor = PromptCompressor(
+                        model_name=self._model_name,
+                        use_slingua=True,
+                        device_map='cpu',
+                    )
+
+    @property
+    def model_loaded(self) -> bool:
+        return self._compressor is not None
 
     def compress(self, text: str, rate: float, kind: str) -> str:
-        raise NotImplementedError('SecurityLinguaBackend will be implemented in PR4')
+        """Compress text using SecurityLingua. Returns compressed string."""
+        self.load()
+        with self._compress_lock:
+            result = self._compressor.compress_prompt(
+                text,
+                rate=max(0.1, min(0.99, rate)),
+                force_tokens=['\n', '.', ',', '!', '?'],
+                drop_consecutive=True,
+            )
+        compressed = result.get('compressed_prompt', text)
+        if not compressed or not compressed.strip():
+            return text
+        return compressed
 
 
 def get_backend(name: str, model_name: str | None = None) -> Backend:
@@ -99,6 +146,6 @@ def get_backend(name: str, model_name: str | None = None) -> Backend:
         default = 'microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank'
         return LLMLingua2Backend(model_name or default)
     if name == 'securitylingua':
-        default = 'microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank'
+        default = 'SecurityLingua/securitylingua-xlm-s2s'
         return SecurityLinguaBackend(model_name or default)
     raise ValueError(f'Unknown backend: {name!r}. Supported: stub, llmlingua2, securitylingua')
