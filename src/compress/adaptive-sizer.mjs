@@ -1,6 +1,13 @@
 import { createHash } from 'node:crypto';
 import { deflateSync } from 'node:zlib';
 
+// Hard cap for countUniqueSimhash: greedy clustering is O(n²) on diverse
+// inputs. At 500 items the worst case is ~250k comparisons (~60ms), well
+// within latency budget. Beyond this cap we conservatively assume all items
+// are unique. Realistic Copilot CLI sessions are well under 500 messages.
+// TODO: replace with LSH bucketing by hash prefix for large-context support.
+export const MAX_SIMHASH_ITEMS = 500;
+
 export function computeOptimalK(
   items,
   { bias = 1.0, minK = 3, maxK } = {},
@@ -112,16 +119,9 @@ function hammingDistance(left, right) {
   return distance;
 }
 
-// KNOWN LIMITATION (inherited from the Headroom reference implementation,
-// confirmed present in adaptive_sizer.py's `count_unique_simhash` too — not
-// a JS-port regression): greedy clustering compares every item against
-// every existing cluster representative with no LSH/bucketing, making this
-// effectively O(n^2) on genuinely diverse input (measured: ~15s at 10,000
-// diverse items — slower than skipping compression entirely). MUST add
-// LSH-style bucketing by hash prefix (or an explicit input-size cap) before
-// this module is wired into any live path handling large diverse outputs.
 export function countUniqueSimhash(items, threshold = 3) {
   if (!items.length) return 0;
+  if (items.length > MAX_SIMHASH_ITEMS) return items.length;
 
   const fingerprints = items.map((item) => simhash(item));
   const clusters = [];

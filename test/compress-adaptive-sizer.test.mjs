@@ -6,6 +6,7 @@ import {
   computeUniqueBigramCurve,
   countUniqueSimhash,
   findKnee,
+  MAX_SIMHASH_ITEMS,
 } from '../src/compress/adaptive-sizer.mjs';
 
 const LOW_DIVERSITY_ITEMS = Array.from(
@@ -130,5 +131,24 @@ describe('adaptive sizer', () => {
     assert.equal(oldestSubset, 6);
     assert.equal(actual, newestSubset);
     assert.notEqual(actual, oldestSubset);
+  });
+
+  it('countUniqueSimhash computes normally at exactly MAX_SIMHASH_ITEMS', () => {
+    const items = Array.from({ length: MAX_SIMHASH_ITEMS }, (_, i) => `item ${i}`);
+    const result = countUniqueSimhash(items);
+    assert.ok(result > 0 && result <= MAX_SIMHASH_ITEMS);
+  });
+
+  it('countUniqueSimhash returns items.length when over MAX_SIMHASH_ITEMS', () => {
+    const size = MAX_SIMHASH_ITEMS + 1;
+    const items = Array.from({ length: size }, (_, i) => `item ${i}`);
+    assert.equal(countUniqueSimhash(items), size);
+  });
+
+  it('countUniqueSimhash with 1000 items completes in under 100ms', () => {
+    const items = Array.from({ length: 1000 }, (_, i) => `item ${i} pad ${i * 7}`);
+    const start = performance.now();
+    countUniqueSimhash(items);
+    assert.ok(performance.now() - start < 100, 'expected <100ms for 1000 items');
   });
 });
