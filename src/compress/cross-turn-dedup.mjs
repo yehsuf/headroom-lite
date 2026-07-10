@@ -25,17 +25,6 @@ function isTrivialLine(line) {
   return trimmed.length < 4 || TRIVIAL_LINES.has(trimmed);
 }
 
-// KNOWN LIMITATION (inherited from the Headroom reference implementation,
-// confirmed present in cross_turn_dedup.py's `_pointer`/`m[2]` too — not a
-// JS-port regression): `refLine` indexes into the referenced block's
-// pre-fold, original-length verbatim array. If that block itself already
-// folded an earlier duplicate into a pointer line, its *displayed* text is
-// shorter than this indexing assumes, so line numbers can point past what's
-// actually shown for that turn. Only triggers when a referenced block (a)
-// contains a fold of its own AND (b) has unique content after that fold
-// which a later block then references. MUST be fixed (recompute against the
-// referenced block's actual rendered position, not its raw verbatim index)
-// before this module is wired into any live compression path.
 function makePointer(span, refTurn, refLine) {
   let anchor = span.find((line) => line.trim())?.trim() ?? '';
   if (anchor.length > 80) anchor = `${anchor.slice(0, 77)}...`;
@@ -101,6 +90,10 @@ export function dedupBlocks(
 
   try {
     const corpus = [];
+    // Parallel to corpus: maps verbatim array index → displayed line number (0-based)
+    // within that block's output text. Used to convert raw verbatim positions into
+    // rendered positions when building pointer text for later blocks.
+    const displayMaps = [];
     const anchorIndex = new Map();
     const outputBlocks = [];
 
@@ -109,14 +102,20 @@ export function dedupBlocks(
 
       if (block.protected) {
         const verbatim = [...lines];
+        // Protected blocks are emitted verbatim: displayed index equals verbatim index.
+        const displayMap = verbatim.map((_, i) => i);
         indexLines(verbatim, corpus.length, anchorIndex);
         corpus.push(verbatim);
+        displayMaps.push(displayMap);
         outputBlocks.push({ ...block });
         continue;
       }
 
       const outputLines = [];
       const verbatim = [];
+      // displayMap[verbatimSlot] = 0-based line number in this block's outputLines.
+      const displayMap = [];
+      let displayIndex = 0;
       let index = 0;
 
       while (index < lines.length) {
@@ -126,9 +125,14 @@ export function dedupBlocks(
           const spanText = span.join('\n');
           if (spanText.length >= minChars) {
             const refTurn = blocks[match[1]].turn;
-            const pointer = makePointer(span, refTurn, match[2]);
+            // Use the rendered position in the referenced block, not its raw verbatim index.
+            const refDisplayLine = displayMaps[match[1]][match[2]];
+            const pointer = makePointer(span, refTurn, refDisplayLine);
             outputLines.push(pointer);
+            // All k folded slots map to the single pointer output line.
+            for (let k = 0; k < match[0]; k += 1) displayMap.push(displayIndex);
             verbatim.push(...Array(match[0]).fill(null));
+            displayIndex += 1;
             stats.spansFolded += 1;
             stats.linesRemoved += match[0];
             stats.charsRemoved += spanText.length - pointer.length;
@@ -139,11 +143,14 @@ export function dedupBlocks(
 
         outputLines.push(lines[index]);
         verbatim.push(lines[index]);
+        displayMap.push(displayIndex);
+        displayIndex += 1;
         index += 1;
       }
 
       indexLines(verbatim, corpus.length, anchorIndex);
       corpus.push(verbatim);
+      displayMaps.push(displayMap);
       outputBlocks.push({
         ...block,
         text: outputLines.join('\n'),
