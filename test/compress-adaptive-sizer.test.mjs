@@ -145,10 +145,17 @@ describe('adaptive sizer', () => {
     assert.equal(countUniqueSimhash(items), size);
   });
 
-  it('countUniqueSimhash with 1000 items completes in under 100ms', () => {
-    const items = Array.from({ length: 1000 }, (_, i) => `item ${i} pad ${i * 7}`);
+  it('countUniqueSimhash at MAX_SIMHASH_ITEMS-1 (worst case) completes in under 500ms', () => {
+    // Uses MAX_SIMHASH_ITEMS - 1 so the cap does NOT fire — this exercises the actual
+    // O(n²) clustering path at the maximum allowed input. Each item must be maximally
+    // diverse (unique content) to stress the full comparison loop.
+    const items = Array.from({ length: MAX_SIMHASH_ITEMS - 1 }, (_, i) =>
+      `unique-content-entry-${i}-pad-${Math.imul(i, 2654435761) >>> 0}`
+    );
     const start = performance.now();
-    countUniqueSimhash(items);
-    assert.ok(performance.now() - start < 100, 'expected <100ms for 1000 items');
+    const result = countUniqueSimhash(items);
+    const elapsed = performance.now() - start;
+    assert.ok(result > 0 && result <= MAX_SIMHASH_ITEMS - 1);
+    assert.ok(elapsed < 500, `expected <500ms for ${MAX_SIMHASH_ITEMS - 1} diverse items, got ${elapsed.toFixed(1)}ms`);
   });
 });

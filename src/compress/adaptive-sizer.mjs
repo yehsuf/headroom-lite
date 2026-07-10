@@ -2,9 +2,14 @@ import { createHash } from 'node:crypto';
 import { deflateSync } from 'node:zlib';
 
 // Hard cap for countUniqueSimhash: greedy clustering is O(n²) on diverse
-// inputs. At 500 items the worst case is ~250k comparisons (~60ms), well
-// within latency budget. Beyond this cap we conservatively assume all items
-// are unique. Realistic Copilot CLI sessions are well under 500 messages.
+// inputs. At 500 items the worst case is ~250k comparisons (~200ms), within
+// latency budget. Beyond this cap we conservatively assume all items are unique.
+//
+// Note: pipeline.mjs has a separate MAX_ADAPTIVE_SIZER_ITEMS = 10 cap that
+// prevents computeOptimalK (the primary caller) from ever reaching this limit
+// on the current live path. This 500-item cap is a defensive backstop for
+// any future direct callers of countUniqueSimhash outside the pipeline.
+//
 // TODO: replace with LSH bucketing by hash prefix for large-context support.
 export const MAX_SIMHASH_ITEMS = 500;
 
