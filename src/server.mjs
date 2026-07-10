@@ -1,5 +1,6 @@
 import http from 'node:http';
-import { compressMessages } from './compress/pipeline.mjs';
+import { compressMessages, compressMessagesAsync } from './compress/pipeline.mjs';
+import { resolveLossyConfig } from './lossy/config.mjs';
 import { normalizeTools } from './normalize/tools.mjs';
 import { detectVolatileContent } from './analyze/volatile-detector.mjs';
 import { proxyRequest, proxyCompressedRequest, resolveUpstream, resolveProxyTimeoutMs, resolveCompressProxy, resolveCompressLive } from './proxy.mjs';
@@ -87,7 +88,7 @@ export function resolveMaxBodyBytes(input = process.env.HEADROOM_LITE_MAX_BODY_B
   return parseIntOption(input, DEFAULT_MAX_BODY_BYTES);
 }
 
-async function handleCompress(request, response, { maxBodyBytes, compressLive }) {
+async function handleCompress(request, response, { maxBodyBytes, compressLive, lossyConfig }) {
   const rawBody = await readRequestBody(request, maxBodyBytes);
 
   let payload;
@@ -101,11 +102,13 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive })
     throw new HttpError(400, '`messages` must be a JSON array');
   }
 
-  const { messages, tokensBefore, tokensAfter, frozenCount } = compressMessages(payload.messages, {
+  const result = await compressMessagesAsync(payload.messages, {
     format: typeof payload.format === 'string' ? payload.format : 'anthropic',
     model: typeof payload.model === 'string' ? payload.model : 'default',
     compressLive,
+    lossy: lossyConfig,
   });
+  const { messages, tokensBefore, tokensAfter, frozenCount } = result;
 
   _stats.compressRequests++;
   _stats.compressTokensBefore += tokensBefore;
@@ -126,6 +129,7 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive })
   };
   if (normalizedTools !== undefined) responseBody.normalized_tools = normalizedTools;
   if (warnings.length > 0) responseBody.warnings = warnings;
+  if (lossyConfig && lossyConfig.enabled) responseBody.lossy = result.lossy;
 
   // OpenAI prompt_cache_key injection for OpenAI-format requests
   if (payload.format === 'openai' && resolveOpenAICacheKey()) {
@@ -155,7 +159,7 @@ async function routeRequest(request, response, options) {
 
   if (method === 'GET' && url.pathname === '/health') {
     // Check whether any upstream is configured
-    const { upstreams } = options;
+    const { upstreams, lossyConfig } = options;
     const anyUpstream = upstreams.legacy ?? upstreams.anthropic ?? upstreams.openai ?? upstreams['github-models'];
     writeJson(response, 200, {
       status: 'ok',
@@ -166,6 +170,11 @@ async function routeRequest(request, response, options) {
       // legacy field kept for one release for backward compat with existing scrapers
       upstream: upstreams.legacy,
       upstreams,
+      lossy: {
+        enabled: lossyConfig.enabled,
+        backend: lossyConfig.backend,
+        service_url: lossyConfig.serviceUrl,
+      },
     });
     return;
   }
@@ -228,6 +237,7 @@ export function createServer({
   proxyTimeoutMs = resolveProxyTimeoutMs(),
   compressProxy = resolveCompressProxy(),
   compressLive = resolveCompressLive(),
+  lossyConfig = resolveLossyConfig(),
 } = {}) {
   const resolvedUpstreams = upstreams ?? {
     legacy: upstream,
@@ -237,7 +247,7 @@ export function createServer({
   };
 
   const server = http.createServer((request, response) => {
-    routeRequest(request, response, { maxBodyBytes, upstreams: resolvedUpstreams, proxyTimeoutMs, compressProxy, compressLive }).catch((error) => {
+    routeRequest(request, response, { maxBodyBytes, upstreams: resolvedUpstreams, proxyTimeoutMs, compressProxy, compressLive, lossyConfig }).catch((error) => {
       if (error instanceof HttpError) {
         writeJson(response, error.statusCode, { error: error.message });
         return;
@@ -264,6 +274,7 @@ export function startServer({
   proxyTimeoutMs = resolveProxyTimeoutMs(),
   compressProxy = resolveCompressProxy(),
   compressLive = resolveCompressLive(),
+  lossyConfig = resolveLossyConfig(),
 } = {}) {
   let resolvedUpstreams;
   if (upstreams !== undefined) {
@@ -274,7 +285,7 @@ export function startServer({
     resolvedUpstreams = resolveUpstreams();
   }
 
-  const server = createServer({ maxBodyBytes, upstreams: resolvedUpstreams, proxyTimeoutMs, compressProxy, compressLive });
+  const server = createServer({ maxBodyBytes, upstreams: resolvedUpstreams, proxyTimeoutMs, compressProxy, compressLive, lossyConfig });
 
   return new Promise((resolve, reject) => {
     server.once('error', reject);
