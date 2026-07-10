@@ -14,6 +14,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { parseIntOption } from './lib/config.mjs';
+import { compressMessages } from './compress/pipeline.mjs';
 
 // RFC 7230 §6.1 — fixed set of hop-by-hop headers that must not be forwarded.
 // The Connection header value may also name additional hop-by-hop headers;
@@ -31,6 +32,7 @@ const HOP_BY_HOP = new Set([
 ]);
 
 export const DEFAULT_PROXY_TIMEOUT_MS = 5 * 60 * 1_000; // 5 minutes — covers long SSE streams
+export const DEFAULT_MAX_BODY_BYTES = 5 * 1024 * 1024; // 5 MB — proxy compression read limit
 
 export function resolveUpstream(input = process.env.HEADROOM_LITE_UPSTREAM) {
   if (!input) return null;
@@ -52,6 +54,11 @@ export function resolveUpstream(input = process.env.HEADROOM_LITE_UPSTREAM) {
 
 export function resolveProxyTimeoutMs(input = process.env.HEADROOM_LITE_PROXY_TIMEOUT_MS) {
   return parseIntOption(input, DEFAULT_PROXY_TIMEOUT_MS);
+}
+
+export function resolveCompressProxy(input = process.env.HEADROOM_LITE_COMPRESS_PROXY) {
+  if (!input) return false;
+  return input === 'true' || input === '1';
 }
 
 function buildForwardHeaders(source) {
@@ -79,9 +86,9 @@ function buildForwardHeaders(source) {
  *
  * @param {import('node:http').IncomingMessage} inboundReq
  * @param {import('node:http').ServerResponse} inboundRes
- * @param {{ upstream: string, timeoutMs?: number }} options
+ * @param {{ upstream: string, timeoutMs?: number, body?: Buffer|null }} options
  */
-export function proxyRequest(inboundReq, inboundRes, { upstream, timeoutMs = DEFAULT_PROXY_TIMEOUT_MS }) {
+export function proxyRequest(inboundReq, inboundRes, { upstream, timeoutMs = DEFAULT_PROXY_TIMEOUT_MS, body = null }) {
   const upstreamBase = new URL(upstream);
   const isHttps = upstreamBase.protocol === 'https:';
   const transport = isHttps ? https : http;
@@ -96,6 +103,13 @@ export function proxyRequest(inboundReq, inboundRes, { upstream, timeoutMs = DEF
 
   const forwardHeaders = buildForwardHeaders(inboundReq.headers);
   forwardHeaders['host'] = upstreamBase.host;
+
+  // When we have a pre-read body buffer, set the exact length and drop transfer-encoding
+  // so the upstream sees a well-formed Content-Length request.
+  if (body !== null) {
+    forwardHeaders['content-length'] = String(body.length);
+    delete forwardHeaders['transfer-encoding'];
+  }
 
   const upstreamOptions = {
     hostname: upstreamBase.hostname,
@@ -167,18 +181,88 @@ export function proxyRequest(inboundReq, inboundRes, { upstream, timeoutMs = DEF
     if (clientClosed) return;
 
     const statusCode = error.message === 'upstream request timed out' ? 504 : 502;
-    const body = JSON.stringify({ error: error.message });
+    const errorBody = JSON.stringify({ error: error.message });
     try {
       inboundRes.writeHead(statusCode, {
         'content-type': 'application/json; charset=utf-8',
-        'content-length': Buffer.byteLength(body).toString(),
+        'content-length': Buffer.byteLength(errorBody).toString(),
       });
-      inboundRes.end(body);
+      inboundRes.end(errorBody);
     } catch {
       if (!inboundRes.destroyed) inboundRes.destroy();
     }
   });
 
-  // Pipe inbound request body to upstream (GET requests have no body — pipe is a no-op)
-  inboundReq.pipe(upstreamReq, { end: true });
+  // If a pre-read body buffer is provided, write it directly; otherwise pipe the inbound stream.
+  if (body !== null) {
+    upstreamReq.end(body);
+  } else {
+    // Pipe inbound request body to upstream (GET requests have no body — pipe is a no-op)
+    inboundReq.pipe(upstreamReq, { end: true });
+  }
+}
+
+function detectFormat(pathname) {
+  if (pathname.startsWith('/v1/messages')) return 'anthropic';
+  if (pathname.includes('/chat/completions')) return 'openai';
+  if (pathname.includes('/v1/responses')) return 'openai';
+  return 'unknown';
+}
+
+/**
+ * Like proxyRequest, but first reads and (when possible) compresses the JSON request body.
+ * Falls back to forwarding the original body on any error.
+ *
+ * @param {import('node:http').IncomingMessage} inboundReq
+ * @param {import('node:http').ServerResponse} inboundRes
+ * @param {{ upstream: string, timeoutMs?: number, maxBodyBytes?: number }} options
+ */
+export async function proxyCompressedRequest(inboundReq, inboundRes, {
+  upstream,
+  timeoutMs = DEFAULT_PROXY_TIMEOUT_MS,
+  maxBodyBytes = DEFAULT_MAX_BODY_BYTES,
+} = {}) {
+  // Buffer the full request body so we can inspect, compress, and forward it.
+  let rawBody;
+  try {
+    const chunks = [];
+    for await (const chunk of inboundReq) {
+      chunks.push(chunk);
+    }
+    rawBody = Buffer.concat(chunks);
+  } catch {
+    if (!inboundRes.headersSent && !inboundRes.destroyed) {
+      const msg = JSON.stringify({ error: 'failed to read request body' });
+      try {
+        inboundRes.writeHead(502, {
+          'content-type': 'application/json; charset=utf-8',
+          'content-length': String(Buffer.byteLength(msg)),
+        });
+        inboundRes.end(msg);
+      } catch { /* socket already gone */ }
+    }
+    return;
+  }
+
+  // Only attempt compression when body is within size limit and content-type is JSON.
+  if (rawBody.length <= maxBodyBytes) {
+    const contentType = inboundReq.headers['content-type'] ?? '';
+    if (contentType.includes('application/json')) {
+      try {
+        const parsed = JSON.parse(rawBody.toString('utf8'));
+        if (parsed && typeof parsed === 'object' && Array.isArray(parsed.messages)) {
+          const inboundParsed = new URL(inboundReq.url ?? '/', 'http://placeholder');
+          const format = detectFormat(inboundParsed.pathname);
+          const { messages } = compressMessages(parsed.messages, { format });
+          const compressed = Buffer.from(JSON.stringify({ ...parsed, messages }), 'utf8');
+          proxyRequest(inboundReq, inboundRes, { upstream, timeoutMs, body: compressed });
+          return;
+        }
+      } catch {
+        // Compression failed — fall through to forward original body unchanged.
+      }
+    }
+  }
+
+  proxyRequest(inboundReq, inboundRes, { upstream, timeoutMs, body: rawBody });
 }
