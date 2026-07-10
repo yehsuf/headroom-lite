@@ -40,21 +40,45 @@ export function collapseRuns(text) {
   return joinLines(output, hadTrailingNewline);
 }
 
-export function expandRuns(text) {
+export function expandRuns(text, { maxOutputLength = Number.POSITIVE_INFINITY } = {}) {
   const { lines, hadTrailingNewline } = splitKeepTrailing(text);
   if (!lines.length) return text;
 
   const output = [];
+  let expandedLength = 0;
+  let outputLineCount = 0;
   let index = 0;
+
+  const addLinesWithinBudget = (line, runLength, maxOutputLength) => {
+    if (runLength === 0) return;
+    const repeatedLineLength = line.length + 1;
+    const firstLineLength = line.length + (hadTrailingNewline ? 1 : 0);
+    const growth = outputLineCount === 0
+      ? firstLineLength + ((runLength - 1) * repeatedLineLength)
+      : runLength * repeatedLineLength;
+
+    if (expandedLength + growth > maxOutputLength) {
+      throw new Error('expanded output exceeds verification budget');
+    }
+
+    expandedLength += growth;
+    outputLineCount += runLength;
+  };
 
   while (index < lines.length) {
     const line = lines[index];
     const marker = index + 1 < lines.length ? lines[index + 1].match(RUN_MARKER_RE) : null;
     if (marker) {
-      output.push(...Array(Number(marker[1])).fill(line));
+      const runLength = Number(marker[1]);
+      if (!Number.isSafeInteger(runLength)) {
+        throw new Error('run marker exceeds supported integer range');
+      }
+      addLinesWithinBudget(line, runLength, maxOutputLength);
+      for (let repeat = 0; repeat < runLength; repeat += 1) output.push(line);
       index += 2;
       continue;
     }
+    addLinesWithinBudget(line, 1, maxOutputLength);
     output.push(line);
     index += 1;
   }
@@ -189,7 +213,10 @@ export function compactLossless(content, kind) {
     if (kind === 'log') {
       const baseline = stripAnsi(content);
       const candidate = collapseRuns(baseline);
-      if (expandRuns(candidate) !== baseline) return content;
+      // Verification only needs to rebuild up to the original baseline length.
+      // Anything larger can only come from an input-authored fake marker, so
+      // bail out before allocating a disproportionate temporary buffer.
+      if (expandRuns(candidate, { maxOutputLength: baseline.length }) !== baseline) return content;
       return isSmaller(candidate, content) ? candidate : content;
     }
 
@@ -212,7 +239,9 @@ export function compactLossless(content, kind) {
 
     if (kind === 'text') {
       const candidate = collapseRuns(content);
-      if (expandRuns(candidate) !== content) return content;
+      // See the log path above: round-trip verification should never need to
+      // reconstruct more than the original text length.
+      if (expandRuns(candidate, { maxOutputLength: content.length }) !== content) return content;
       return isSmaller(candidate, content) ? candidate : content;
     }
   } catch {

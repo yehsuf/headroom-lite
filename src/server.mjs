@@ -122,7 +122,8 @@ export function createServer({ maxBodyBytes = resolveMaxBodyBytes() } = {}) {
     });
   });
 
-  server.on('clientError', (_error, socket) => {
+  server.on('clientError', (error, socket) => {
+    if (error.code === 'ECONNRESET' || !socket.writable) return;
     socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
   });
 

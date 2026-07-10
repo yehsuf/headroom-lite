@@ -39,8 +39,9 @@ function isTrivialLine(line) {
 function makePointer(span, refTurn, refLine) {
   let anchor = span.find((line) => line.trim())?.trim() ?? '';
   if (anchor.length > 80) anchor = `${anchor.slice(0, 77)}...`;
-  const endLine = refLine + span.length - 1;
-  return `[myelin: ${span.length} lines identical to output shown earlier (turn ${refTurn}, lines ${refLine}-${endLine}) — starts: ${JSON.stringify(anchor)}]`;
+  const displayStartLine = refLine + 1;
+  const displayEndLine = displayStartLine + span.length - 1;
+  return `[myelin: ${span.length} lines identical to output shown earlier (turn ${refTurn}, lines ${displayStartLine}-${displayEndLine}) — starts: ${JSON.stringify(anchor)}]`;
 }
 
 function indexLines(lines, blockIndex, anchorIndex) {

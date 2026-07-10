@@ -1,7 +1,7 @@
 import { after, before, describe, it } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { compressMessages } from '../src/compress/pipeline.mjs';
-import { startServer } from '../src/server.mjs';
+import { createServer, startServer } from '../src/server.mjs';
 
 const DUPLICATE_FILE_SPAN = [
   'export async function login(user, password) {',
@@ -128,7 +128,7 @@ describe('HTTP server', () => {
       body.messages[3].content,
       'src/auth/login.mjs\n10:const alpha = 1;\n11:const beta = 2;\nsrc/auth/audit.mjs\n3:export function gamma() {}\n',
     );
-    assert.match(body.messages[4].content, /\[myelin: 8 lines identical to output shown earlier \(turn 2, lines 1-8\)/);
+    assert.match(body.messages[4].content, /\[myelin: 8 lines identical to output shown earlier \(turn 2, lines 2-9\)/);
     assert.equal(
       body.messages[5].content,
       'Summarize the duplicate code output and the repeated log lines.',
@@ -148,5 +148,40 @@ describe('HTTP server', () => {
     assert.deepEqual(await response.json(), {
       error: '`messages` must be a JSON array',
     });
+  });
+
+  it('skips clientError writes when the socket is not writable or already reset', () => {
+    const clientErrorServer = createServer();
+    let endCalls = 0;
+
+    clientErrorServer.emit('clientError', { code: 'ECONNRESET' }, {
+      writable: true,
+      end() {
+        endCalls += 1;
+      },
+    });
+
+    clientErrorServer.emit('clientError', { code: 'HPE_INVALID_METHOD' }, {
+      writable: false,
+      end() {
+        endCalls += 1;
+      },
+    });
+
+    assert.equal(endCalls, 0);
+  });
+
+  it('still returns a 400 response for writable clientError sockets', () => {
+    const clientErrorServer = createServer();
+    let payload = null;
+
+    clientErrorServer.emit('clientError', { code: 'HPE_INVALID_METHOD' }, {
+      writable: true,
+      end(chunk) {
+        payload = chunk;
+      },
+    });
+
+    assert.equal(payload, 'HTTP/1.1 400 Bad Request\r\n\r\n');
   });
 });

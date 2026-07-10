@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import { strict as assert } from 'node:assert';
 import {
+  collapseRuns,
   compactLossless,
   expandRuns,
   searchHeading,
@@ -46,6 +47,24 @@ describe('lossless compaction', () => {
   it('falls back when compaction does not actually shrink the output', () => {
     const original = 'single line only\n';
 
+    assert.equal(compactLossless(original, 'text'), original);
+  });
+
+  it('short-circuits fake embedded run markers that exceed the verification budget', () => {
+    const original = [
+      'alpha',
+      'alpha',
+      'beta',
+      '... (repeated 100000 times)',
+      'omega',
+      '',
+    ].join('\n');
+    const candidate = collapseRuns(original);
+
+    assert.throws(
+      () => expandRuns(candidate, { maxOutputLength: original.length }),
+      /verification budget/,
+    );
     assert.equal(compactLossless(original, 'text'), original);
   });
 });
