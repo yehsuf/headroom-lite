@@ -73,9 +73,11 @@ def test_get_backend_unknown_raises():
         get_backend('nope')
 
 
-def test_get_backend_llmlingua2_notimplemented():
+def test_get_backend_llmlingua2_raises_when_uninstalled(monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, 'llmlingua', None)
     b = get_backend('llmlingua2')
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(RuntimeError, match='llmlingua not installed'):
         b.compress('x', 0.5, 'prose')
 
 
@@ -114,7 +116,10 @@ def test_compress_item_stub_success():
     assert result['compressed_chars'] < result['original_chars']
 
 
-def test_compress_item_handles_notimplemented():
+def test_compress_item_handles_backend_error(monkeypatch):
+    """llmlingua2 backend without llmlingua installed → RuntimeError → graceful fallback."""
+    import sys
+    monkeypatch.setitem(sys.modules, 'llmlingua', None)
     with _reset_svc_state('llmlingua2'):
         item = {'id': 'x', 'text': 'hello world', 'kind': 'prose'}
         result = svc._compress_item(item, 0.5)
@@ -323,3 +328,170 @@ def test_post_to_health_is_404():
     with _test_server('stub') as hp:
         status, _ = _http_request(hp, 'POST', '/health', body={})
     assert status == 404
+
+
+# ── LLMLingua2Backend tests ──────────────────────────────────────────────
+
+def test_llmlingua2_backend_load_raises_when_not_installed(monkeypatch):
+    """If llmlingua is not installed, load() raises RuntimeError."""
+    import sys
+    monkeypatch.setitem(sys.modules, 'llmlingua', None)  # block import
+    from headroom_lingua_service.backends import LLMLingua2Backend
+    b = LLMLingua2Backend()
+    with pytest.raises(RuntimeError, match='llmlingua not installed'):
+        b.load()
+
+
+def test_llmlingua2_backend_compress_raises_when_not_installed(monkeypatch):
+    """compress() with no llmlingua installed raises RuntimeError."""
+    import sys
+    monkeypatch.setitem(sys.modules, 'llmlingua', None)
+    from headroom_lingua_service.backends import LLMLingua2Backend
+    b = LLMLingua2Backend()
+    with pytest.raises(RuntimeError, match='llmlingua not installed'):
+        b.compress('some text', 0.5, 'prose')
+
+
+def test_llmlingua2_backend_compress_extracts_compressed_prompt(monkeypatch):
+    """compress() correctly extracts result['compressed_prompt'] from the dict."""
+    import types, sys
+    fake_llmlingua = types.ModuleType('llmlingua')
+
+    class _FakePC:
+        def __init__(self, **kw):
+            pass
+
+        def compress_prompt(self, text, **kw):
+            return {'compressed_prompt': 'SHORT', 'origin_tokens': 100, 'compressed_tokens': 5}
+
+    fake_llmlingua.PromptCompressor = _FakePC
+    monkeypatch.setitem(sys.modules, 'llmlingua', fake_llmlingua)
+    from importlib import reload
+    import headroom_lingua_service.backends as b_mod
+    reload(b_mod)
+    try:
+        b = b_mod.LLMLingua2Backend()
+        result = b.compress('Some long text here', 0.5, 'prose')
+        assert result == 'SHORT'
+    finally:
+        reload(b_mod)  # restore real module state
+
+
+def test_llmlingua2_backend_fallback_when_empty_compressed(monkeypatch):
+    """If compressed_prompt is empty/whitespace, returns original text."""
+    import types, sys
+    fake = types.ModuleType('llmlingua')
+
+    class _FakePC:
+        def __init__(self, **kw):
+            pass
+
+        def compress_prompt(self, text, **kw):
+            return {'compressed_prompt': '   '}
+
+    fake.PromptCompressor = _FakePC
+    monkeypatch.setitem(sys.modules, 'llmlingua', fake)
+    from importlib import reload
+    import headroom_lingua_service.backends as b_mod
+    reload(b_mod)
+    try:
+        b = b_mod.LLMLingua2Backend()
+        original = 'Some text to compress'
+        assert b.compress(original, 0.5, 'prose') == original
+    finally:
+        reload(b_mod)
+
+
+def test_llmlingua2_backend_rate_clamped(monkeypatch):
+    """rate is clamped to [0.1, 0.99] before passing to PromptCompressor."""
+    import types, sys
+    recorded = {}
+    fake = types.ModuleType('llmlingua')
+
+    class _FakePC:
+        def __init__(self, **kw):
+            pass
+
+        def compress_prompt(self, text, rate=0.5, **kw):
+            recorded['rate'] = rate
+            return {'compressed_prompt': 'x'}
+
+    fake.PromptCompressor = _FakePC
+    monkeypatch.setitem(sys.modules, 'llmlingua', fake)
+    from importlib import reload
+    import headroom_lingua_service.backends as b_mod
+    reload(b_mod)
+    try:
+        b = b_mod.LLMLingua2Backend()
+        b.compress('text', 0.0, 'prose')   # should clamp to 0.1
+        assert recorded['rate'] == pytest.approx(0.1)
+        b.compress('text', 1.5, 'prose')   # should clamp to 0.99
+        assert recorded['rate'] == pytest.approx(0.99)
+    finally:
+        reload(b_mod)
+
+
+def test_llmlingua2_backend_model_loaded_false_before_load(monkeypatch):
+    """model_loaded is False before compress() is called."""
+    import sys
+    monkeypatch.setitem(sys.modules, 'llmlingua', None)
+    from headroom_lingua_service.backends import LLMLingua2Backend
+    b = LLMLingua2Backend()
+    assert b.model_loaded is False
+
+
+def test_llmlingua2_backend_double_checked_locking(monkeypatch):
+    """Calling load() twice only creates one PromptCompressor instance."""
+    import types, sys
+    load_count = [0]
+    fake = types.ModuleType('llmlingua')
+
+    class _FakePC:
+        def __init__(self, **kw):
+            load_count[0] += 1
+
+        def compress_prompt(self, text, **kw):
+            return {'compressed_prompt': 'x'}
+
+    fake.PromptCompressor = _FakePC
+    monkeypatch.setitem(sys.modules, 'llmlingua', fake)
+    from importlib import reload
+    import headroom_lingua_service.backends as b_mod
+    reload(b_mod)
+    try:
+        b = b_mod.LLMLingua2Backend()
+        b.load()
+        b.load()  # second call is no-op
+        assert load_count[0] == 1
+    finally:
+        reload(b_mod)
+
+
+# ── Gated model smoke test ────────────────────────────────────────────────
+
+import os
+_REAL_MODEL = pytest.mark.skipif(
+    os.environ.get('RUN_LLMLINGUA_MODEL_TESTS') != '1',
+    reason='Set RUN_LLMLINGUA_MODEL_TESTS=1 to run real model tests (downloads ~677MB)'
+)
+
+
+@_REAL_MODEL
+def test_llmlingua2_real_model_compresses():
+    """Smoke test: real LLMLingua-2 model compresses a prose paragraph."""
+    from headroom_lingua_service.backends import LLMLingua2Backend
+    b = LLMLingua2Backend()
+    long_text = ('This is a test of the emergency broadcast system. ' * 30)  # ~1500 chars
+    compressed = b.compress(long_text, 0.5, 'prose')
+    assert len(compressed) < len(long_text), 'Expected compression'
+    assert len(compressed) > 0
+
+
+@_REAL_MODEL
+def test_llmlingua2_real_model_preserves_newlines():
+    """force_tokens=['\\n',...] means newlines survive compression."""
+    from headroom_lingua_service.backends import LLMLingua2Backend
+    b = LLMLingua2Backend()
+    text = 'Line one.\nLine two.\nLine three.\n' * 20
+    compressed = b.compress(text, 0.5, 'prose')
+    assert '\n' in compressed, 'Newlines must be preserved by force_tokens'

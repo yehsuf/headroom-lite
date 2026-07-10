@@ -21,11 +21,18 @@ _model_loaded = False
 
 
 def _get_or_init_backend() -> Any:
-    """Return the initialised backend, creating it if needed."""
+    """Return the initialised backend, creating it if needed.
+
+    Also refreshes the module-level `_model_loaded` flag so `/health` and
+    compress responses reflect the backend's current lazy-load state.
+    """
     global _backend_instance, _model_loaded
     with _backend_lock:
         if _backend_instance is None:
             _backend_instance = get_backend(_backend_name, _model_name)
+        if hasattr(_backend_instance, 'model_loaded'):
+            _model_loaded = bool(_backend_instance.model_loaded)
+        else:
             _model_loaded = isinstance(_backend_instance, StubBackend)
         return _backend_instance
 
@@ -104,6 +111,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         target_rate = float(req.get('target_rate', 0.5))
         result_items = [_compress_item(item, target_rate) for item in items]
+        _get_or_init_backend()  # refresh model_loaded (esp. when items is empty)
         self._send_json(200, {
             'items': result_items,
             'backend': _backend_name,
