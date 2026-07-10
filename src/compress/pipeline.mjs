@@ -228,8 +228,8 @@ function chooseProtectedHistoricalMessages(candidates, latestMessageIndex) {
   );
 }
 
-export function compressMessages(messages, _options = {}) {
-  const frozenCount = computeFrozenCount(messages);
+export function compressMessages(messages, { format = 'anthropic', model = 'default' } = {}) {
+  const frozenCount = computeFrozenCount(messages, { format });
   const frozen = messages.slice(0, frozenCount);
   const live = messages.slice(frozenCount);
 

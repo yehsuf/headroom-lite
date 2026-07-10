@@ -332,3 +332,77 @@ describe('dedup turn numbers with frozen prefix', () => {
     assert.deepStrictEqual(out[0], messages[0]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 5. Format-aware frozen-prefix tests (PR3)
+// ---------------------------------------------------------------------------
+
+describe('computeFrozenCount — format awareness', () => {
+  const messagesWithCC = [
+    { role: 'user', content: [{ type: 'text', text: 'cached', cache_control: { type: 'ephemeral' } }] },
+    { role: 'assistant', content: 'response' },
+  ];
+
+  it('default (no opts) behaves as anthropic — cache_control is respected', () => {
+    assert.equal(computeFrozenCount(messagesWithCC), 1);
+  });
+
+  it('format: anthropic explicitly — cache_control is respected', () => {
+    assert.equal(computeFrozenCount(messagesWithCC, { format: 'anthropic' }), 1);
+  });
+
+  it('format: openai — frozenCount is 0 even when cache_control present (defense-in-depth)', () => {
+    assert.equal(computeFrozenCount(messagesWithCC, { format: 'openai' }), 0);
+  });
+
+  it('format: github-models — frozenCount is 0 even when cache_control present', () => {
+    assert.equal(computeFrozenCount(messagesWithCC, { format: 'github-models' }), 0);
+  });
+
+  it('format: unknown — frozenCount is 0 (safe default for unrecognised formats)', () => {
+    assert.equal(computeFrozenCount(messagesWithCC, { format: 'unknown' }), 0);
+  });
+
+  it('format: openai, no cache_control — frozenCount is still 0', () => {
+    const msgs = [
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: 'world' },
+    ];
+    assert.equal(computeFrozenCount(msgs, { format: 'openai' }), 0);
+  });
+});
+
+describe('compressMessages — format option wired through to frozen count', () => {
+  const BIG = Array.from({ length: 20 }, (_, i) => `line ${i}: some text`).join('\n');
+
+  const msgsWithCC = [
+    { role: 'user', content: [{ type: 'text', text: BIG, cache_control: { type: 'ephemeral' } }] },
+    { role: 'assistant', content: BIG },
+    { role: 'user', content: 'final question' },
+  ];
+
+  it('format: anthropic (default) — first message frozen, returned byte-exact', () => {
+    const { frozenCount, messages: out } = compressMessages(msgsWithCC, { format: 'anthropic' });
+    assert.equal(frozenCount, 1);
+    assert.deepStrictEqual(out[0], msgsWithCC[0], 'frozen message must be byte-exact');
+  });
+
+  it('format: openai — frozenCount is 0, all messages eligible for compression', () => {
+    const { frozenCount } = compressMessages(msgsWithCC, { format: 'openai' });
+    assert.equal(frozenCount, 0);
+  });
+
+  it('format: openai — stray cache_control does not protect message from compression', () => {
+    // With format=openai, even a message carrying cache_control is treated as live zone
+    const { frozenCount, tokensBefore, tokensAfter } = compressMessages(msgsWithCC, { format: 'openai' });
+    assert.equal(frozenCount, 0);
+    // Tokens may be reduced (live zone compressed) or stay same — just confirm no freeze
+    assert.ok(tokensAfter <= tokensBefore, 'should not expand tokens');
+  });
+
+  it('omitting format defaults to anthropic — cache_control still respected (backward compat)', () => {
+    // Preserves pre-PR3 behavior: callers that don't pass format get Anthropic semantics.
+    const { frozenCount } = compressMessages(msgsWithCC);
+    assert.equal(frozenCount, 1);
+  });
+});

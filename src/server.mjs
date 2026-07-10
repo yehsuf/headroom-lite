@@ -71,7 +71,7 @@ async function handleCompress(request, response, { maxBodyBytes }) {
   }
 
   const { messages, tokensBefore, tokensAfter, frozenCount } = compressMessages(payload.messages, {
-    format: typeof payload.format === 'string' ? payload.format : 'unknown',
+    format: typeof payload.format === 'string' ? payload.format : 'anthropic',
     model: typeof payload.model === 'string' ? payload.model : 'default',
   });
 
