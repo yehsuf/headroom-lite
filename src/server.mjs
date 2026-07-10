@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { compressMessages } from './compress/pipeline.mjs';
 import { normalizeTools } from './normalize/tools.mjs';
+import { detectVolatileContent } from './analyze/volatile-detector.mjs';
 import { proxyRequest, resolveUpstream, resolveProxyTimeoutMs } from './proxy.mjs';
 import { parseIntOption } from './lib/config.mjs';
 
@@ -74,6 +75,9 @@ async function handleCompress(request, response, { maxBodyBytes }) {
     ? normalizeTools(payload.tools)
     : undefined;
 
+  const system = typeof payload.system === 'string' ? payload.system : null;
+  const warnings = detectVolatileContent({ messages: payload.messages, frozenCount, system });
+
   const responseBody = {
     messages,
     tokens_before: tokensBefore,
@@ -81,6 +85,7 @@ async function handleCompress(request, response, { maxBodyBytes }) {
     frozen_count: frozenCount,
   };
   if (normalizedTools !== undefined) responseBody.normalized_tools = normalizedTools;
+  if (warnings.length > 0) responseBody.warnings = warnings;
   writeJson(response, 200, responseBody);
 }
 
