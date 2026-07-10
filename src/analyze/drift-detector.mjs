@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { computeFrozenCount } from '../compress/frozen-prefix.mjs';
 
 export const DEFAULT_SESSION_TTL_MS = 60 * 60 * 1_000; // 1 hour
 export const DEFAULT_MAX_SESSIONS = 10_000; // hard cap to prevent unbounded Map growth
@@ -16,28 +17,34 @@ export class DriftDetector {
    * Only covers parts that should stay constant across requests for a session:
    *   - system prompt (normalized to string)
    *   - tool names (order-independent: sorted alphabetically)
-   *   - first 3 message role+text pairs (the "early messages")
+   *   - frozen prefix messages (those carrying cache_control markers, per P0)
+   *     Falls back to first 3 messages when no markers are present.
    */
   computeHash({ system, tools, messages }) {
+    const msgs = Array.isArray(messages) ? messages : [];
+    // Use the actual frozen prefix (cache_control markers) as the stable zone.
+    // Fall back to the first 3 messages if no markers are present.
+    const frozenCount = computeFrozenCount(msgs);
+    const stableCount = frozenCount > 0 ? frozenCount : Math.min(3, msgs.length);
+
     const canonical = {
       system: system != null ? String(system) : null,
-      // Only tool names — not full schemas (which normalizeTools may have changed)
+      // Only tool names — schemas may be normalized differently across callers
       tools: (Array.isArray(tools) ? tools : [])
         .map((t) => t?.name ?? t?.function?.name ?? '')
         .sort()
         .filter(Boolean),
-      early: (Array.isArray(messages) ? messages : [])
-        .slice(0, 3)
-        .map((m) => ({
-          role: m?.role ?? '',
-          // Text content only — not tool calls, images, etc.
-          text: typeof m?.content === 'string'
-            ? m.content
-            : (Array.isArray(m?.content) ? m.content : [])
-                .filter((b) => b?.type === 'text')
-                .map((b) => b.text ?? '')
-                .join(''),
-        })),
+      // Hash the frozen prefix (stable zone), not an arbitrary fixed window
+      frozen: msgs.slice(0, stableCount).map((m) => ({
+        role: m?.role ?? '',
+        // Text content only — tool calls and images are handled separately
+        text: typeof m?.content === 'string'
+          ? m.content
+          : (Array.isArray(m?.content) ? m.content : [])
+              .filter((b) => b?.type === 'text')
+              .map((b) => b.text ?? '')
+              .join(''),
+      })),
     };
     return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
   }
