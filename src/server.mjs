@@ -11,6 +11,35 @@ import { resolveUpstreams, selectUpstream } from './providers/upstreams.mjs';
 
 const driftDetector = new DriftDetector();
 
+// ── In-memory stats counters (reset on process restart) ──────────────────────
+const _stats = {
+  startedAt: Date.now(),
+  proxyRequests: 0,
+  compressRequests: 0,
+  compressTokensBefore: 0,
+  compressTokensAfter: 0,
+};
+
+/** Read-only snapshot — safe to JSON.serialize directly. */
+export function getStats() {
+  const uptimeSec = Math.floor((Date.now() - _stats.startedAt) / 1000);
+  const saved = _stats.compressTokensBefore - _stats.compressTokensAfter;
+  const pct = _stats.compressTokensBefore > 0
+    ? (saved / _stats.compressTokensBefore * 100).toFixed(1)
+    : '0.0';
+  return {
+    status: 'ok',
+    service: 'headroom-lite',
+    uptime_seconds: uptimeSec,
+    proxy_requests: _stats.proxyRequests,
+    compress_requests: _stats.compressRequests,
+    compress_tokens_before: _stats.compressTokensBefore,
+    compress_tokens_after: _stats.compressTokensAfter,
+    compress_tokens_saved: saved,
+    compress_pct: pct,
+  };
+}
+
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 8790;
 export const DEFAULT_MAX_BODY_BYTES = 5 * 1024 * 1024;
@@ -77,6 +106,10 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive })
     model: typeof payload.model === 'string' ? payload.model : 'default',
     compressLive,
   });
+
+  _stats.compressRequests++;
+  _stats.compressTokensBefore += tokensBefore;
+  _stats.compressTokensAfter += tokensAfter;
 
   const normalizedTools = Array.isArray(payload.tools)
     ? normalizeTools(payload.tools)
@@ -145,6 +178,11 @@ async function routeRequest(request, response, options) {
     return;
   }
 
+  if (method === 'GET' && url.pathname === '/stats') {
+    writeJson(response, 200, getStats());
+    return;
+  }
+
   if (method === 'POST' && url.pathname === '/v1/compress') {
     await handleCompress(request, response, options);
     return;
@@ -155,6 +193,7 @@ async function routeRequest(request, response, options) {
   const chosenUpstream = selectUpstream(options.upstreams, provider);
 
   if (chosenUpstream) {
+    _stats.proxyRequests++;
     if (options.compressProxy) {
       proxyCompressedRequest(request, response, {
         upstream: chosenUpstream,
