@@ -1,0 +1,152 @@
+import { after, before, describe, it } from 'node:test';
+import { strict as assert } from 'node:assert';
+import { compressMessages } from '../src/compress/pipeline.mjs';
+import { startServer } from '../src/server.mjs';
+
+const DUPLICATE_FILE_SPAN = [
+  'export async function login(user, password) {',
+  '  const account = await loadAccount(user);',
+  '  if (!account) throw new Error("missing account");',
+  '  const session = await createSession(account.id);',
+  '  await audit.log("login", account.id, session.id);',
+  '  return { sessionId: session.id, userId: account.id };',
+  '}',
+  'export const LOGIN_TIMEOUT_MS = 30_000;',
+].join('\n');
+
+const SEARCH_OUTPUT = [
+  'src/auth/login.mjs:10:const alpha = 1;',
+  'src/auth/login.mjs:11:const beta = 2;',
+  'src/auth/audit.mjs:3:export function gamma() {}',
+  '',
+].join('\n');
+
+const REPEATED_LOG = [
+  '\u001b[32minfo\u001b[0m build step ok',
+  '\u001b[32minfo\u001b[0m build step ok',
+  '\u001b[32minfo\u001b[0m build step ok',
+  'warn cache miss',
+  '',
+].join('\n');
+
+describe('HTTP server', () => {
+  let server;
+  let baseUrl;
+
+  before(async () => {
+    server = await startServer({
+      host: '127.0.0.1',
+      port: 0,
+      maxBodyBytes: 1024 * 1024,
+    });
+    const address = server.address();
+    baseUrl = `http://127.0.0.1:${address.port}`;
+  });
+
+  after(async () => {
+    await new Promise((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+  });
+
+  it('serves health and liveness endpoints', async () => {
+    const [health, livez] = await Promise.all([
+      fetch(`${baseUrl}/health`),
+      fetch(`${baseUrl}/livez`),
+    ]);
+
+    assert.equal(health.status, 200);
+    assert.equal(livez.status, 200);
+
+    assert.deepEqual(await health.json(), {
+      status: 'ok',
+      service: 'headroom-lite',
+      mode: 'deterministic',
+      max_body_bytes: 1024 * 1024,
+    });
+    assert.deepEqual(await livez.json(), {
+      status: 'alive',
+      service: 'headroom-lite',
+    });
+  });
+
+  it('compresses a conversation via the /v1/compress contract', async () => {
+    const payload = {
+      format: 'openai',
+      model: 'gpt-5',
+      messages: [
+        {
+          role: 'system',
+          content: 'You are a precise assistant.',
+        },
+        {
+          role: 'assistant',
+          content: `cat src/auth/login.mjs\n${DUPLICATE_FILE_SPAN}\n# eof`,
+        },
+        {
+          role: 'tool',
+          content: REPEATED_LOG,
+        },
+        {
+          role: 'assistant',
+          content: SEARCH_OUTPUT,
+        },
+        {
+          role: 'assistant',
+          content: `sed -n '1,8p' src/auth/login.mjs\n${DUPLICATE_FILE_SPAN}\n# done`,
+        },
+        {
+          role: 'user',
+          content: 'Summarize the duplicate code output and the repeated log lines.',
+        },
+      ],
+    };
+
+    const response = await fetch(`${baseUrl}/v1/compress`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const body = await response.json();
+    const expected = compressMessages(payload.messages, {
+      format: payload.format,
+      model: payload.model,
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(body, {
+      messages: expected.messages,
+      tokens_before: expected.tokensBefore,
+      tokens_after: expected.tokensAfter,
+    });
+    assert.ok(body.tokens_after < body.tokens_before);
+    assert.match(body.messages[2].content, /\.\.\. \(repeated 3 times\)/);
+    assert.equal(
+      body.messages[3].content,
+      'src/auth/login.mjs\n10:const alpha = 1;\n11:const beta = 2;\nsrc/auth/audit.mjs\n3:export function gamma() {}\n',
+    );
+    assert.match(body.messages[4].content, /\[myelin: 8 lines identical to output shown earlier \(turn 2, lines 1-8\)/);
+    assert.equal(
+      body.messages[5].content,
+      'Summarize the duplicate code output and the repeated log lines.',
+    );
+  });
+
+  it('rejects invalid compress payloads with a 400', async () => {
+    const response = await fetch(`${baseUrl}/v1/compress`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ format: 'openai' }),
+    });
+
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), {
+      error: '`messages` must be a JSON array',
+    });
+  });
+});

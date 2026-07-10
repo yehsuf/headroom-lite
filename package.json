@@ -1,0 +1,18 @@
+{
+  "name": "headroom-lite",
+  "version": "0.1.0",
+  "description": "Deterministic, zero-ML context compression sidecar compatible with Headroom's /v1/compress contract.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "headroom-lite": "./src/index.mjs"
+  },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "test": "node --test test/**/*.test.mjs",
+    "test:watch": "node --test --watch test/**/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
