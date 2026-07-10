@@ -15,14 +15,17 @@ import http from 'node:http';
 import https from 'node:https';
 import { parseIntOption } from './lib/config.mjs';
 
-// RFC 7230 §6.1 — headers that must not be forwarded between hops
+// RFC 7230 §6.1 — fixed set of hop-by-hop headers that must not be forwarded.
+// The Connection header value may also name additional hop-by-hop headers;
+// those are handled dynamically in buildForwardHeaders().
 const HOP_BY_HOP = new Set([
   'connection',
   'keep-alive',
   'proxy-authenticate',
   'proxy-authorization',
   'te',
-  'trailers',
+  'trailer',    // RFC 7230 §6.1 uses singular "Trailer"
+  'trailers',   // kept for defensive coverage; some implementations use plural
   'transfer-encoding',
   'upgrade',
 ]);
@@ -40,7 +43,10 @@ export function resolveUpstream(input = process.env.HEADROOM_LITE_UPSTREAM) {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     throw new Error(`HEADROOM_LITE_UPSTREAM must use http: or https: — got: ${url.protocol}`);
   }
-  // Return without trailing slash for consistent URL construction
+  if (url.search) {
+    throw new Error(`HEADROOM_LITE_UPSTREAM must not include a query string — got: ${input}`);
+  }
+  // Return without trailing slash for consistent path-prefix prepending
   return url.href.replace(/\/$/, '');
 }
 
@@ -49,10 +55,18 @@ export function resolveProxyTimeoutMs(input = process.env.HEADROOM_LITE_PROXY_TI
 }
 
 function buildForwardHeaders(source) {
+  // RFC 7230 §6.1: the Connection header may list additional hop-by-hop header names.
+  // Strip those dynamically so connection-scoped metadata cannot leak across hops.
+  const connectionValue = String(source['connection'] ?? '');
+  const dynamicHopByHop = new Set(
+    connectionValue.split(',').map((t) => t.trim().toLowerCase()).filter(Boolean),
+  );
+
   const out = {};
   for (const [key, value] of Object.entries(source)) {
     const lower = key.toLowerCase();
     if (HOP_BY_HOP.has(lower)) continue;
+    if (dynamicHopByHop.has(lower)) continue;
     // host is always replaced with the upstream host
     if (lower === 'host') continue;
     out[lower] = value;
@@ -72,8 +86,13 @@ export function proxyRequest(inboundReq, inboundRes, { upstream, timeoutMs = DEF
   const isHttps = upstreamBase.protocol === 'https:';
   const transport = isHttps ? https : http;
 
-  // Build the full target URL from the upstream base + original path + query
-  const targetUrl = new URL(inboundReq.url ?? '/', upstream);
+  // Build the target path: upstream base-path prefix + inbound path + query string.
+  // Using new URL(inboundPath, upstream) would drop the upstream path prefix
+  // (e.g. '/api/v2' from 'http://upstream/api/v2') because the inbound path starts
+  // with '/', which resolves relative to the origin root. We prepend explicitly instead.
+  const inboundParsed = new URL(inboundReq.url ?? '/', 'http://placeholder');
+  const upstreamPathPrefix = upstreamBase.pathname === '/' ? '' : upstreamBase.pathname.replace(/\/$/, '');
+  const targetPath = upstreamPathPrefix + inboundParsed.pathname + inboundParsed.search;
 
   const forwardHeaders = buildForwardHeaders(inboundReq.headers);
   forwardHeaders['host'] = upstreamBase.host;
@@ -81,7 +100,7 @@ export function proxyRequest(inboundReq, inboundRes, { upstream, timeoutMs = DEF
   const upstreamOptions = {
     hostname: upstreamBase.hostname,
     port: upstreamBase.port !== '' ? Number(upstreamBase.port) : (isHttps ? 443 : 80),
-    path: targetUrl.pathname + targetUrl.search,
+    path: targetPath,
     method: inboundReq.method ?? 'GET',
     headers: forwardHeaders,
     timeout: timeoutMs,
@@ -134,6 +153,11 @@ export function proxyRequest(inboundReq, inboundRes, { upstream, timeoutMs = DEF
   });
 
   upstreamReq.on('error', (error) => {
+    // Always clean up the socket listener — the response callback won't fire on error,
+    // so the 'finish' handler inside it would never remove it. Without this, repeated
+    // upstream errors on a keep-alive socket accumulate stale listeners.
+    clientSocket?.off('close', onClientSocketClose);
+
     // If headers already sent (mid-stream SSE), just close the socket
     if (inboundRes.headersSent) {
       if (!inboundRes.destroyed) inboundRes.destroy();

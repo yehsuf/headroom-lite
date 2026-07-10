@@ -96,6 +96,14 @@ describe('resolveUpstream()', () => {
   it('throws on non-http protocol', () => {
     assert.throws(() => resolveUpstreamDirect('ftp://example.com'), /must use http:/);
   });
+
+  it('throws on upstream URL with query string', () => {
+    assert.throws(() => resolveUpstreamDirect('https://api.example.com/v2?key=secret'), /must not include a query string/);
+  });
+
+  it('preserves path prefix in upstream URL', () => {
+    assert.strictEqual(resolveUpstreamDirect('https://api.example.com/v2/'), 'https://api.example.com/v2');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -519,6 +527,161 @@ describe('path and query forwarding', () => {
   it('forwards path and query string verbatim', async () => {
     await request({ host: '127.0.0.1', port: proxyPort, path: '/v1/messages?stream=true&version=2', method: 'GET' });
     assert.strictEqual(receivedPath, '/v1/messages?stream=true&version=2');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Upstream base-path prefix preservation
+// ---------------------------------------------------------------------------
+
+describe('upstream base-path prefix', () => {
+  let upstreamPort;
+  let upstreamServer;
+  let proxyPort;
+  let proxyServer;
+  let receivedPath;
+
+  before(async () => {
+    upstreamServer = http.createServer((req, res) => {
+      receivedPath = req.url;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+    upstreamPort = await listen(upstreamServer);
+
+    // Upstream has a non-root path prefix — must be prepended to all inbound paths
+    proxyServer = createServer({ upstream: `http://127.0.0.1:${upstreamPort}/api/v2` });
+    proxyPort = await listen(proxyServer);
+  });
+
+  after(async () => {
+    await close(proxyServer);
+    await close(upstreamServer);
+  });
+
+  it('prepends upstream path prefix to inbound request path', async () => {
+    await request({ host: '127.0.0.1', port: proxyPort, path: '/v1/messages', method: 'GET' });
+    assert.strictEqual(receivedPath, '/api/v2/v1/messages');
+  });
+
+  it('preserves inbound query string when prepending prefix', async () => {
+    await request({ host: '127.0.0.1', port: proxyPort, path: '/v1/messages?stream=true', method: 'GET' });
+    assert.strictEqual(receivedPath, '/api/v2/v1/messages?stream=true');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Connection-header dynamic hop-by-hop stripping (RFC 7230 §6.1)
+// ---------------------------------------------------------------------------
+
+describe('Connection-header dynamic hop-by-hop stripping', () => {
+  let upstreamPort;
+  let upstreamServer;
+  let proxyPort;
+  let proxyServer;
+  let receivedHeaders;
+
+  before(async () => {
+    upstreamServer = http.createServer((req, res) => {
+      receivedHeaders = req.headers;
+      // Upstream response names a custom hop-by-hop via Connection
+      res.setHeader('x-upstream-secret', 'should-be-stripped');
+      res.setHeader('connection', 'x-upstream-secret');
+      res.setHeader('content-type', 'application/json');
+      res.writeHead(200);
+      res.end('{}');
+    });
+    upstreamPort = await listen(upstreamServer);
+
+    proxyServer = createServer({ upstream: `http://127.0.0.1:${upstreamPort}` });
+    proxyPort = await listen(proxyServer);
+  });
+
+  after(async () => {
+    await close(proxyServer);
+    await close(upstreamServer);
+  });
+
+  it('strips custom header named in client Connection header', async () => {
+    // The request() helper always sets connection:close (overriding options.headers),
+    // so we use a raw TCP socket to send the exact Connection header we want.
+    const { connect } = await import('node:net');
+    await new Promise((resolve, reject) => {
+      const socket = connect(proxyPort, '127.0.0.1', () => {
+        // Send x-client-secret as a hop-by-hop header by listing it in Connection
+        socket.write(
+          'GET /v1/test HTTP/1.1\r\n' +
+          `Host: 127.0.0.1:${proxyPort}\r\n` +
+          'x-client-secret: leaked-value\r\n' +
+          'Connection: x-client-secret, close\r\n' +
+          '\r\n',
+        );
+      });
+      let response = '';
+      socket.on('data', (chunk) => { response += chunk.toString(); });
+      socket.on('end', () => resolve(response));
+      socket.on('error', reject);
+      setTimeout(() => reject(new Error('raw socket timeout')), 3000);
+    });
+    // x-client-secret was named in Connection — must not have reached upstream
+    assert.strictEqual(receivedHeaders['x-client-secret'], undefined);
+  });
+
+  it('strips custom header named in upstream Connection response header', async () => {
+    // Upstream sets Connection: x-upstream-secret — client must not receive x-upstream-secret
+    const res = await request({ host: '127.0.0.1', port: proxyPort, path: '/v1/test', method: 'GET' });
+    assert.strictEqual(res.headers['x-upstream-secret'], undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Client disconnect aborts upstream request (hard constraint #4)
+// ---------------------------------------------------------------------------
+
+describe('client disconnect aborts upstream', () => {
+  let upstreamPort;
+  let upstreamServer;
+  let proxyPort;
+  let proxyServer;
+
+  before(async () => {
+    upstreamServer = http.createServer((_req, res) => {
+      // Upstream hangs — never responds within test window
+      // The test verifies upstream gets notified when client disconnects
+      res.on('close', () => { /* used by test via aborted flag below */ });
+    });
+    upstreamPort = await listen(upstreamServer);
+
+    proxyServer = createServer({ upstream: `http://127.0.0.1:${upstreamPort}`, proxyTimeoutMs: 5000 });
+    proxyPort = await listen(proxyServer);
+  });
+
+  after(async () => {
+    await close(proxyServer);
+    await close(upstreamServer);
+  });
+
+  it('upstream receives connection close when client socket is destroyed', async () => {
+    let upstreamRequestClosed = false;
+    // Override request handler to track close event on this specific request
+    upstreamServer.once('request', (req, _res) => {
+      req.on('close', () => { upstreamRequestClosed = true; });
+    });
+
+    // Connect via raw socket so we can destroy mid-flight without HTTP keep-alive delays
+    const { connect } = await import('node:net');
+    await new Promise((resolve, reject) => {
+      const socket = connect(proxyPort, '127.0.0.1', () => {
+        socket.write('GET /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
+        // Give the proxy time to forward the request to upstream, then disconnect
+        setTimeout(() => { socket.destroy(); resolve(); }, 80);
+      });
+      socket.on('error', reject);
+    });
+
+    // Wait for the close event to propagate through the proxy to the upstream request
+    await new Promise((r) => setTimeout(r, 200));
+    assert.ok(upstreamRequestClosed, 'upstream request should receive close event when client disconnects');
   });
 });
 
