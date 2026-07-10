@@ -6,6 +6,7 @@ import {
   computeUniqueBigramCurve,
   countUniqueSimhash,
   findKnee,
+  MAX_SIMHASH_ITEMS,
 } from '../src/compress/adaptive-sizer.mjs';
 
 const LOW_DIVERSITY_ITEMS = Array.from(
@@ -130,5 +131,31 @@ describe('adaptive sizer', () => {
     assert.equal(oldestSubset, 6);
     assert.equal(actual, newestSubset);
     assert.notEqual(actual, oldestSubset);
+  });
+
+  it('countUniqueSimhash computes normally at exactly MAX_SIMHASH_ITEMS', () => {
+    const items = Array.from({ length: MAX_SIMHASH_ITEMS }, (_, i) => `item ${i}`);
+    const result = countUniqueSimhash(items);
+    assert.ok(result > 0 && result <= MAX_SIMHASH_ITEMS);
+  });
+
+  it('countUniqueSimhash returns items.length when over MAX_SIMHASH_ITEMS', () => {
+    const size = MAX_SIMHASH_ITEMS + 1;
+    const items = Array.from({ length: size }, (_, i) => `item ${i}`);
+    assert.equal(countUniqueSimhash(items), size);
+  });
+
+  it('countUniqueSimhash at MAX_SIMHASH_ITEMS-1 (worst case) completes in under 500ms', () => {
+    // Uses MAX_SIMHASH_ITEMS - 1 so the cap does NOT fire — this exercises the actual
+    // O(n²) clustering path at the maximum allowed input. Each item must be maximally
+    // diverse (unique content) to stress the full comparison loop.
+    const items = Array.from({ length: MAX_SIMHASH_ITEMS - 1 }, (_, i) =>
+      `unique-content-entry-${i}-pad-${Math.imul(i, 2654435761) >>> 0}`
+    );
+    const start = performance.now();
+    const result = countUniqueSimhash(items);
+    const elapsed = performance.now() - start;
+    assert.ok(result > 0 && result <= MAX_SIMHASH_ITEMS - 1);
+    assert.ok(elapsed < 500, `expected <500ms for ${MAX_SIMHASH_ITEMS - 1} diverse items, got ${elapsed.toFixed(1)}ms`);
   });
 });
