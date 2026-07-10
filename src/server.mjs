@@ -64,7 +64,7 @@ async function handleCompress(request, response, { maxBodyBytes }) {
     throw new HttpError(400, '`messages` must be a JSON array');
   }
 
-  const { messages, tokensBefore, tokensAfter } = compressMessages(payload.messages, {
+  const { messages, tokensBefore, tokensAfter, frozenCount } = compressMessages(payload.messages, {
     format: typeof payload.format === 'string' ? payload.format : 'unknown',
     model: typeof payload.model === 'string' ? payload.model : 'default',
   });
@@ -73,6 +73,7 @@ async function handleCompress(request, response, { maxBodyBytes }) {
     messages,
     tokens_before: tokensBefore,
     tokens_after: tokensAfter,
+    frozen_count: frozenCount,
   });
 }
 

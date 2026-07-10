@@ -4,6 +4,7 @@ import {
   DEFAULT_MIN_LINES,
   dedupBlocks,
 } from './cross-turn-dedup.mjs';
+import { computeFrozenCount } from './frozen-prefix.mjs';
 import { compactLossless } from './lossless-compaction.mjs';
 import { estimateMessageTokens } from '../lib/estimate-tokens.mjs';
 
@@ -221,15 +222,20 @@ function chooseProtectedHistoricalMessages(candidates, latestMessageIndex) {
 }
 
 export function compressMessages(messages, _options = {}) {
+  const frozenCount = computeFrozenCount(messages);
+  const frozen = messages.slice(0, frozenCount);
+  const live = messages.slice(frozenCount);
+
   const tokensBefore = estimateMessageTokens(messages);
-  const outputMessages = structuredClone(messages);
-  const leaves = collectTextLeaves(outputMessages);
+
+  const outputLive = structuredClone(live);
+  const leaves = collectTextLeaves(outputLive);
 
   for (const leaf of leaves) {
     leaf.set(compactMessageText(leaf.get()));
   }
 
-  const latestMessageIndex = outputMessages.length - 1;
+  const latestMessageIndex = outputLive.length - 1;
   const lossyCandidates = leaves.filter((leaf) => isLossyEligibleLeaf(leaf, latestMessageIndex));
 
   if (lossyCandidates.length >= 2) {
@@ -247,9 +253,12 @@ export function compressMessages(messages, _options = {}) {
     }
   }
 
+  const outputMessages = [...frozen, ...outputLive];
+
   return {
     messages: outputMessages,
     tokensBefore,
     tokensAfter: estimateMessageTokens(outputMessages),
+    frozenCount,
   };
 }

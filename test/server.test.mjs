@@ -122,6 +122,7 @@ describe('HTTP server', () => {
       messages: expected.messages,
       tokens_before: expected.tokensBefore,
       tokens_after: expected.tokensAfter,
+      frozen_count: expected.frozenCount,
     });
     assert.ok(body.tokens_after < body.tokens_before);
     assert.match(body.messages[2].content, /\.\.\. \(repeated 3 times\)/);
