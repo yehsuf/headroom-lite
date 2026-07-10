@@ -15,6 +15,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { parseIntOption } from './lib/config.mjs';
 import { compressMessages } from './compress/pipeline.mjs';
+import { detectFormat } from './providers/detect.mjs';
 
 // RFC 7230 §6.1 — fixed set of hop-by-hop headers that must not be forwarded.
 // The Connection header value may also name additional hop-by-hop headers;
@@ -200,13 +201,6 @@ export function proxyRequest(inboundReq, inboundRes, { upstream, timeoutMs = DEF
     // Pipe inbound request body to upstream (GET requests have no body — pipe is a no-op)
     inboundReq.pipe(upstreamReq, { end: true });
   }
-}
-
-function detectFormat(pathname) {
-  if (pathname.startsWith('/v1/messages')) return 'anthropic';
-  if (pathname.includes('/chat/completions')) return 'openai';
-  if (pathname.includes('/v1/responses')) return 'openai';
-  return 'unknown';
 }
 
 /**
