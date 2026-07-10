@@ -2,7 +2,7 @@ import http from 'node:http';
 import { compressMessages } from './compress/pipeline.mjs';
 import { normalizeTools } from './normalize/tools.mjs';
 import { detectVolatileContent } from './analyze/volatile-detector.mjs';
-import { proxyRequest, resolveUpstream, resolveProxyTimeoutMs } from './proxy.mjs';
+import { proxyRequest, proxyCompressedRequest, resolveUpstream, resolveProxyTimeoutMs, resolveCompressProxy } from './proxy.mjs';
 import { parseIntOption } from './lib/config.mjs';
 import { DriftDetector } from './analyze/drift-detector.mjs';
 import { injectOpenAICacheKey, resolveOpenAICacheKey } from './normalize/openai-cache-key.mjs';
@@ -14,7 +14,7 @@ export const DEFAULT_PORT = 8790;
 export const DEFAULT_MAX_BODY_BYTES = 5 * 1024 * 1024;
 
 // Re-export proxy config helpers so callers only need to import from server.mjs
-export { resolveUpstream, resolveProxyTimeoutMs };
+export { resolveUpstream, resolveProxyTimeoutMs, resolveCompressProxy };
 
 class HttpError extends Error {
   constructor(statusCode, message) {
@@ -143,16 +143,35 @@ async function routeRequest(request, response, options) {
 
   // Transparent passthrough proxy — only active when upstream is configured
   if (options.upstream) {
-    proxyRequest(request, response, { upstream: options.upstream, timeoutMs: options.proxyTimeoutMs });
+    if (options.compressProxy) {
+      proxyCompressedRequest(request, response, {
+        upstream: options.upstream,
+        timeoutMs: options.proxyTimeoutMs,
+        maxBodyBytes: options.maxBodyBytes,
+      }).catch(() => {
+        if (!response.headersSent && !response.destroyed) {
+          const msg = JSON.stringify({ error: 'proxy error' });
+          try {
+            response.writeHead(502, {
+              'content-type': 'application/json; charset=utf-8',
+              'content-length': String(Buffer.byteLength(msg)),
+            });
+            response.end(msg);
+          } catch { /* socket already gone */ }
+        }
+      });
+    } else {
+      proxyRequest(request, response, { upstream: options.upstream, timeoutMs: options.proxyTimeoutMs });
+    }
     return;
   }
 
   writeJson(response, 404, { error: 'not found' });
 }
 
-export function createServer({ maxBodyBytes = resolveMaxBodyBytes(), upstream = null, proxyTimeoutMs = resolveProxyTimeoutMs() } = {}) {
+export function createServer({ maxBodyBytes = resolveMaxBodyBytes(), upstream = null, proxyTimeoutMs = resolveProxyTimeoutMs(), compressProxy = resolveCompressProxy() } = {}) {
   const server = http.createServer((request, response) => {
-    routeRequest(request, response, { maxBodyBytes, upstream, proxyTimeoutMs }).catch((error) => {
+    routeRequest(request, response, { maxBodyBytes, upstream, proxyTimeoutMs, compressProxy }).catch((error) => {
       if (error instanceof HttpError) {
         writeJson(response, error.statusCode, { error: error.message });
         return;
@@ -176,8 +195,9 @@ export function startServer({
   maxBodyBytes = resolveMaxBodyBytes(),
   upstream = resolveUpstream(),
   proxyTimeoutMs = resolveProxyTimeoutMs(),
+  compressProxy = resolveCompressProxy(),
 } = {}) {
-  const server = createServer({ maxBodyBytes, upstream, proxyTimeoutMs });
+  const server = createServer({ maxBodyBytes, upstream, proxyTimeoutMs, compressProxy });
 
   return new Promise((resolve, reject) => {
     server.once('error', reject);
