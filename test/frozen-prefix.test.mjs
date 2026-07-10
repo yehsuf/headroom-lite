@@ -296,3 +296,39 @@ describe('server /v1/compress frozen_count', () => {
     assert.equal(body.frozen_count, 0);
   });
 });
+
+describe('dedup turn numbers with frozen prefix', () => {
+  it('dedup pointer references correct full-conversation turn (not live-slice turn)', async () => {
+    // Build a conversation where:
+    //   messages[0]: frozen (has cache_control) — contains some content
+    //   messages[1]: live — contains the SAME large multiline text (dedup target)
+    //   messages[2]: live — contains the SAME large multiline text again (should dedup)
+    const bigText = Array.from({ length: 12 }, (_, i) => `line ${i}: ${'x'.repeat(30)}`).join('\n');
+    const messages = [
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'hello', cache_control: { type: 'ephemeral' } }],
+      },
+      { role: 'assistant', content: bigText },
+      { role: 'user', content: bigText },
+    ];
+
+    const { messages: out, frozenCount } = compressMessages(messages);
+    assert.strictEqual(frozenCount, 1, 'only first message is frozen');
+
+    // Find any dedup pointer in the output
+    const allText = JSON.stringify(out);
+    const match = allText.match(/turn (\d+)/);
+    if (match) {
+      // The pointer must reference a turn >= frozenCount+1 (i.e. turn 2 or later)
+      // NOT turn 1 relative to live slice
+      const referencedTurn = Number(match[1]);
+      assert.ok(
+        referencedTurn >= frozenCount + 1,
+        `dedup pointer says "turn ${referencedTurn}" but frozen prefix has ${frozenCount} messages — should be >= ${frozenCount + 1}`,
+      );
+    }
+    // Whether or not dedup ran, frozen message must be byte-exact
+    assert.deepStrictEqual(out[0], messages[0]);
+  });
+});

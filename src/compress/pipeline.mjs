@@ -242,7 +242,10 @@ export function compressMessages(messages, _options = {}) {
     const protectedMessages = chooseProtectedHistoricalMessages(lossyCandidates, latestMessageIndex);
     const { blocks } = dedupBlocks(
       lossyCandidates.map((leaf) => ({
-        turn: leaf.messageIndex + 1,
+        // Turn numbers must be 1-based relative to the FULL conversation, not the
+        // live slice — otherwise dedup pointers say "turn 1" when the correct
+        // display turn in the conversation is frozenCount+1.
+        turn: leaf.messageIndex + frozenCount + 1,
         text: leaf.get(),
         protected: protectedMessages.has(leaf.messageIndex),
       })),
