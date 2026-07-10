@@ -2,7 +2,7 @@ import http from 'node:http';
 import { compressMessages } from './compress/pipeline.mjs';
 import { normalizeTools } from './normalize/tools.mjs';
 import { detectVolatileContent } from './analyze/volatile-detector.mjs';
-import { proxyRequest, proxyCompressedRequest, resolveUpstream, resolveProxyTimeoutMs, resolveCompressProxy } from './proxy.mjs';
+import { proxyRequest, proxyCompressedRequest, resolveUpstream, resolveProxyTimeoutMs, resolveCompressProxy, resolveCompressLive } from './proxy.mjs';
 import { parseIntOption } from './lib/config.mjs';
 import { DriftDetector } from './analyze/drift-detector.mjs';
 import { injectOpenAICacheKey, resolveOpenAICacheKey } from './normalize/openai-cache-key.mjs';
@@ -16,7 +16,7 @@ export const DEFAULT_PORT = 8790;
 export const DEFAULT_MAX_BODY_BYTES = 5 * 1024 * 1024;
 
 // Re-export proxy config helpers so callers only need to import from server.mjs
-export { resolveUpstream, resolveProxyTimeoutMs, resolveCompressProxy };
+export { resolveUpstream, resolveProxyTimeoutMs, resolveCompressProxy, resolveCompressLive };
 
 class HttpError extends Error {
   constructor(statusCode, message) {
@@ -58,7 +58,7 @@ export function resolveMaxBodyBytes(input = process.env.HEADROOM_LITE_MAX_BODY_B
   return parseIntOption(input, DEFAULT_MAX_BODY_BYTES);
 }
 
-async function handleCompress(request, response, { maxBodyBytes }) {
+async function handleCompress(request, response, { maxBodyBytes, compressLive }) {
   const rawBody = await readRequestBody(request, maxBodyBytes);
 
   let payload;
@@ -75,6 +75,7 @@ async function handleCompress(request, response, { maxBodyBytes }) {
   const { messages, tokensBefore, tokensAfter, frozenCount } = compressMessages(payload.messages, {
     format: typeof payload.format === 'string' ? payload.format : 'anthropic',
     model: typeof payload.model === 'string' ? payload.model : 'default',
+    compressLive,
   });
 
   const normalizedTools = Array.isArray(payload.tools)
@@ -128,6 +129,7 @@ async function routeRequest(request, response, options) {
       service: 'headroom-lite',
       mode: anyUpstream ? 'proxy+deterministic' : 'deterministic',
       max_body_bytes: options.maxBodyBytes,
+      compress_live: options.compressLive,
       // legacy field kept for one release for backward compat with existing scrapers
       upstream: upstreams.legacy,
       upstreams,
@@ -158,6 +160,7 @@ async function routeRequest(request, response, options) {
         upstream: chosenUpstream,
         timeoutMs: options.proxyTimeoutMs,
         maxBodyBytes: options.maxBodyBytes,
+        compressLive: options.compressLive,
       }).catch(() => {
         if (!response.headersSent && !response.destroyed) {
           const msg = JSON.stringify({ error: 'proxy error' });
@@ -181,12 +184,12 @@ async function routeRequest(request, response, options) {
 
 export function createServer({
   maxBodyBytes = resolveMaxBodyBytes(),
-  upstream = null,     // legacy single-upstream (backward compat) — wrapped into upstreams.legacy
-  upstreams = null,    // new: full provider map; takes precedence over upstream
+  upstream = null,
+  upstreams = null,
   proxyTimeoutMs = resolveProxyTimeoutMs(),
   compressProxy = resolveCompressProxy(),
+  compressLive = resolveCompressLive(),
 } = {}) {
-  // Synthesize the upstreams map: explicit map beats legacy single-upstream.
   const resolvedUpstreams = upstreams ?? {
     legacy: upstream,
     anthropic: null,
@@ -195,7 +198,7 @@ export function createServer({
   };
 
   const server = http.createServer((request, response) => {
-    routeRequest(request, response, { maxBodyBytes, upstreams: resolvedUpstreams, proxyTimeoutMs, compressProxy }).catch((error) => {
+    routeRequest(request, response, { maxBodyBytes, upstreams: resolvedUpstreams, proxyTimeoutMs, compressProxy, compressLive }).catch((error) => {
       if (error instanceof HttpError) {
         writeJson(response, error.statusCode, { error: error.message });
         return;
@@ -217,15 +220,12 @@ export function startServer({
   host = process.env.HEADROOM_LITE_HOST ?? DEFAULT_HOST,
   port = resolvePort(),
   maxBodyBytes = resolveMaxBodyBytes(),
-  upstream = undefined,    // legacy: explicit single URL — wrapped as upstreams.legacy
-  upstreams = undefined,   // new: explicit provider map
+  upstream = undefined,
+  upstreams = undefined,
   proxyTimeoutMs = resolveProxyTimeoutMs(),
   compressProxy = resolveCompressProxy(),
+  compressLive = resolveCompressLive(),
 } = {}) {
-  // Resolution priority:
-  //   1. Explicit upstreams map (caller provided full map)
-  //   2. Explicit upstream string (caller provided legacy single URL)
-  //   3. Load everything from env (default startup path)
   let resolvedUpstreams;
   if (upstreams !== undefined) {
     resolvedUpstreams = upstreams;
@@ -235,7 +235,7 @@ export function startServer({
     resolvedUpstreams = resolveUpstreams();
   }
 
-  const server = createServer({ maxBodyBytes, upstreams: resolvedUpstreams, proxyTimeoutMs, compressProxy });
+  const server = createServer({ maxBodyBytes, upstreams: resolvedUpstreams, proxyTimeoutMs, compressProxy, compressLive });
 
   return new Promise((resolve, reject) => {
     server.once('error', reject);

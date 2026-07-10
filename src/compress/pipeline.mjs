@@ -175,8 +175,10 @@ function collectTextLeaves(messages) {
   return leaves;
 }
 
-function isLossyEligibleLeaf(leaf, latestMessageIndex) {
-  if (leaf.messageIndex === latestMessageIndex) return false;
+function isLossyEligibleLeaf(leaf, latestMessageIndex, compressLive) {
+  // In normal mode the latest message is never lossy-compressed (TTFT/context quality).
+  // In live mode the caller has explicitly opted in — drop this protection.
+  if (!compressLive && leaf.messageIndex === latestMessageIndex) return false;
   if (NEVER_LOSSY_ROLES.has(leaf.role)) return false;
   if (SKIP_MUTATION_KEYS.has(leaf.fieldKey)) return false;
 
@@ -228,7 +230,7 @@ function chooseProtectedHistoricalMessages(candidates, latestMessageIndex) {
   );
 }
 
-export function compressMessages(messages, { format = 'anthropic', model = 'default' } = {}) {
+export function compressMessages(messages, { format = 'anthropic', model = 'default', compressLive = false } = {}) {
   const frozenCount = computeFrozenCount(messages, { format });
   const frozen = messages.slice(0, frozenCount);
   const live = messages.slice(frozenCount);
@@ -243,10 +245,14 @@ export function compressMessages(messages, { format = 'anthropic', model = 'defa
   }
 
   const latestMessageIndex = outputLive.length - 1;
-  const lossyCandidates = leaves.filter((leaf) => isLossyEligibleLeaf(leaf, latestMessageIndex));
+  const lossyCandidates = leaves.filter((leaf) => isLossyEligibleLeaf(leaf, latestMessageIndex, compressLive));
 
   if (lossyCandidates.length >= 2) {
-    const protectedMessages = chooseProtectedHistoricalMessages(lossyCandidates, latestMessageIndex);
+    // In live mode skip the adaptive-sizer entirely — user opted in to maximum compression.
+    // cache_control / signature guards are unaffected (enforced by frozen prefix + SKIP_SUBTREES).
+    const protectedMessages = compressLive
+      ? new Set()
+      : chooseProtectedHistoricalMessages(lossyCandidates, latestMessageIndex);
     const { blocks } = dedupBlocks(
       lossyCandidates.map((leaf) => ({
         // Turn numbers must be 1-based relative to the FULL conversation, not the

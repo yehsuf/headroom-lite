@@ -63,6 +63,7 @@ describe('HTTP server', () => {
       service: 'headroom-lite',
       mode: 'deterministic',
       max_body_bytes: 1024 * 1024,
+      compress_live: false,
       upstream: null,
       upstreams: { legacy: null, anthropic: null, openai: null, 'github-models': null },
     });

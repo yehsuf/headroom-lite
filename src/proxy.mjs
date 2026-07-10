@@ -62,6 +62,19 @@ export function resolveCompressProxy(input = process.env.HEADROOM_LITE_COMPRESS_
   return input === 'true' || input === '1';
 }
 
+/**
+ * Resolve the HEADROOM_LITE_COMPRESS env var.
+ * Returns true only when the value is exactly 'live' (case-insensitive, trimmed).
+ * Any other value (absent, empty, 'safe', typos) returns false.
+ *
+ * @param {string|undefined} [input]
+ * @returns {boolean}
+ */
+export function resolveCompressLive(input = process.env.HEADROOM_LITE_COMPRESS) {
+  if (typeof input !== 'string') return false;
+  return input.trim().toLowerCase() === 'live';
+}
+
 function buildForwardHeaders(source) {
   // RFC 7230 §6.1: the Connection header may list additional hop-by-hop header names.
   // Strip those dynamically so connection-scoped metadata cannot leak across hops.
@@ -209,12 +222,13 @@ export function proxyRequest(inboundReq, inboundRes, { upstream, timeoutMs = DEF
  *
  * @param {import('node:http').IncomingMessage} inboundReq
  * @param {import('node:http').ServerResponse} inboundRes
- * @param {{ upstream: string, timeoutMs?: number, maxBodyBytes?: number }} options
+ * @param {{ upstream: string, timeoutMs?: number, maxBodyBytes?: number, compressLive?: boolean }} options
  */
 export async function proxyCompressedRequest(inboundReq, inboundRes, {
   upstream,
   timeoutMs = DEFAULT_PROXY_TIMEOUT_MS,
   maxBodyBytes = DEFAULT_MAX_BODY_BYTES,
+  compressLive = false,
 } = {}) {
   // Buffer the full request body so we can inspect, compress, and forward it.
   let rawBody;
@@ -247,7 +261,7 @@ export async function proxyCompressedRequest(inboundReq, inboundRes, {
         if (parsed && typeof parsed === 'object' && Array.isArray(parsed.messages)) {
           const inboundParsed = new URL(inboundReq.url ?? '/', 'http://placeholder');
           const format = detectFormat(inboundParsed.pathname);
-          const { messages } = compressMessages(parsed.messages, { format });
+          const { messages } = compressMessages(parsed.messages, { format, compressLive });
           const compressed = Buffer.from(JSON.stringify({ ...parsed, messages }), 'utf8');
           proxyRequest(inboundReq, inboundRes, { upstream, timeoutMs, body: compressed });
           return;
