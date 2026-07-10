@@ -9,6 +9,7 @@ import { computeFrozenCount } from './frozen-prefix.mjs';
 import { minifyJson } from './json-minifier.mjs';
 import { compactLossless } from './lossless-compaction.mjs';
 import { withTagProtection } from './tag-protector.mjs';
+import { compactToolOutputs } from './tool-output-compactor.mjs';
 import { estimateMessageTokens } from '../lib/estimate-tokens.mjs';
 
 const SEARCH_ROW_RE = /^[^\n:]+:\d+:.*$/m;
@@ -238,13 +239,22 @@ export function compressMessages(messages, { format = 'anthropic', model = 'defa
   const tokensBefore = estimateMessageTokens(messages);
 
   const outputLive = structuredClone(live);
-  const leaves = collectTextLeaves(outputLive);
+  const latestMessageIndex = outputLive.length - 1;
 
+  // Phase 1: text-leaf compaction (diffs, logs, search results, JSON minification).
+  const leaves = collectTextLeaves(outputLive);
   for (const leaf of leaves) {
     leaf.set(compactMessageText(leaf.get()));
   }
 
-  const latestMessageIndex = outputLive.length - 1;
+  // Phase 2: JSON array → CSV compaction for tool_result blocks.
+  // Runs AFTER the text-leaf loop so the generated CSV strings are never
+  // re-encountered by compactMessageText. Running before would cause
+  // PATH_ROW_RE to match CSV rows like "src/a.mjs,0" (comma is not excluded),
+  // triggering pathHeading which strips shared directory prefixes and corrupts
+  // the CSV output (e.g. "src/" appears as a separate heading line).
+  compactToolOutputs(outputLive, latestMessageIndex);
+
   const lossyCandidates = leaves.filter((leaf) => isLossyEligibleLeaf(leaf, latestMessageIndex, compressLive));
 
   if (lossyCandidates.length >= 2) {
