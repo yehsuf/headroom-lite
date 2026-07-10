@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { compressMessages } from './compress/pipeline.mjs';
+import { normalizeTools } from './normalize/tools.mjs';
 import { proxyRequest, resolveUpstream, resolveProxyTimeoutMs } from './proxy.mjs';
 import { parseIntOption } from './lib/config.mjs';
 
@@ -69,12 +70,18 @@ async function handleCompress(request, response, { maxBodyBytes }) {
     model: typeof payload.model === 'string' ? payload.model : 'default',
   });
 
-  writeJson(response, 200, {
+  const normalizedTools = Array.isArray(payload.tools)
+    ? normalizeTools(payload.tools)
+    : undefined;
+
+  const responseBody = {
     messages,
     tokens_before: tokensBefore,
     tokens_after: tokensAfter,
     frozen_count: frozenCount,
-  });
+  };
+  if (normalizedTools !== undefined) responseBody.normalized_tools = normalizedTools;
+  writeJson(response, 200, responseBody);
 }
 
 async function routeRequest(request, response, options) {
