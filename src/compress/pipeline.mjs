@@ -288,3 +288,106 @@ export function compressMessages(messages, { format = 'anthropic', model = 'defa
     frozenCount,
   };
 }
+
+/**
+ * Async lossy compression pipeline.
+ * Runs deterministic lossless compression first, then optionally applies
+ * LLMLingua lossy compression to eligible text leaves.
+ *
+ * @param {Array} messages
+ * @param {object} options
+ * @param {string} [options.format='anthropic']
+ * @param {string} [options.model='default']
+ * @param {boolean} [options.compressLive=false]
+ * @param {object} [options.lossy]  resolveLossyConfig() result
+ * @returns {Promise<object>}  { messages, tokensBefore, tokensAfter, frozenCount, lossy }
+ */
+export async function compressMessagesAsync(messages, {
+  format = 'anthropic',
+  model = 'default',
+  compressLive = false,
+  lossy = { enabled: false },
+} = {}) {
+  // Step 1: lossless deterministic compression (sync)
+  const deterministic = compressMessages(messages, { format, model, compressLive });
+
+  // Step 2: if lossy disabled, return with lossy metadata
+  if (!lossy.enabled) {
+    return {
+      ...deterministic,
+      lossy: { enabled: false },
+    };
+  }
+
+  // Step 3: collect candidates (after frozen prefix)
+  const { collectLossyCandidates } = await import('./lossy-eligibility.mjs');
+  const { validateCompressedText } = await import('./lossy-guards.mjs');
+  const { compressTexts } = await import('../lossy/client.mjs');
+
+  const candidates = collectLossyCandidates(deterministic.messages, {
+    format,
+    frozenCount: deterministic.frozenCount ?? 0,
+    compressLive,
+    minChars: lossy.minChars ?? 1000,
+    maxChars: lossy.maxChars ?? 60000,
+    compressCode: lossy.compressCode ?? false,
+  });
+
+  if (candidates.length === 0) {
+    return {
+      ...deterministic,
+      lossy: { enabled: true, attempted: 0, applied: 0, rejected: 0 },
+    };
+  }
+
+  // Step 4: call service (fail-open by default)
+  let serviceResult;
+  try {
+    serviceResult = await compressTexts(candidates, lossy);
+  } catch (err) {
+    return {
+      ...deterministic,
+      lossy: {
+        enabled: true,
+        attempted: candidates.length,
+        applied: 0,
+        rejected: candidates.length,
+        error: String(err?.message || err),
+      },
+    };
+  }
+
+  // Step 5: apply validated results
+  const resultMessages = JSON.parse(JSON.stringify(deterministic.messages));
+  let applied = 0;
+  let rejected = 0;
+
+  for (const original of candidates) {
+    const result = serviceResult.items?.find((r) => r.id === original.id);
+    if (!result || !result.compressed || result.error) { rejected++; continue; }
+    if (!validateCompressedText(original.text, result.text, original.kind)) { rejected++; continue; }
+
+    const msg = resultMessages[original.msgIdx];
+    if (original.contentIdx === null) {
+      msg.content = result.text;
+    } else {
+      msg.content[original.contentIdx].text = result.text;
+    }
+    applied++;
+  }
+
+  return {
+    messages: resultMessages,
+    tokensBefore: deterministic.tokensBefore,
+    tokensAfter: deterministic.tokensAfter, // conservative — not re-estimated
+    frozenCount: deterministic.frozenCount ?? 0,
+    lossy: {
+      enabled: true,
+      attempted: candidates.length,
+      applied,
+      rejected,
+      backend: lossy.backend,
+      modelName: lossy.modelName,
+    },
+  };
+}

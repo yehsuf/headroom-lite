@@ -66,6 +66,7 @@ describe('HTTP server', () => {
       compress_live: false,
       upstream: null,
       upstreams: { legacy: null, anthropic: null, openai: null, 'github-models': null },
+      lossy: { enabled: false, backend: 'llmlingua2', service_url: 'http://127.0.0.1:8791' },
     });
     assert.deepEqual(await livez.json(), {
       status: 'alive',
