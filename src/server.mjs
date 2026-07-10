@@ -4,6 +4,9 @@ import { normalizeTools } from './normalize/tools.mjs';
 import { detectVolatileContent } from './analyze/volatile-detector.mjs';
 import { proxyRequest, resolveUpstream, resolveProxyTimeoutMs } from './proxy.mjs';
 import { parseIntOption } from './lib/config.mjs';
+import { DriftDetector } from './analyze/drift-detector.mjs';
+
+const driftDetector = new DriftDetector();
 
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 8790;
@@ -86,6 +89,18 @@ async function handleCompress(request, response, { maxBodyBytes }) {
   };
   if (normalizedTools !== undefined) responseBody.normalized_tools = normalizedTools;
   if (warnings.length > 0) responseBody.warnings = warnings;
+
+  // Cache drift detection — only when caller provides a valid session_id (max 256 chars)
+  if (typeof payload.session_id === 'string' && payload.session_id.length > 0 &&
+      payload.session_id.length <= 256) {
+    const driftInfo = driftDetector.check(payload.session_id, {
+      system: payload.system,
+      tools: payload.tools,
+      messages: payload.messages,
+    });
+    responseBody.cache_drift = driftInfo;
+  }
+
   writeJson(response, 200, responseBody);
 }
 
