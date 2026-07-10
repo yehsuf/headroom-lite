@@ -1,9 +1,14 @@
 import http from 'node:http';
 import { compressMessages } from './compress/pipeline.mjs';
+import { proxyRequest, resolveUpstream, resolveProxyTimeoutMs } from './proxy.mjs';
+import { parseIntOption } from './lib/config.mjs';
 
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 8790;
 export const DEFAULT_MAX_BODY_BYTES = 5 * 1024 * 1024;
+
+// Re-export proxy config helpers so callers only need to import from server.mjs
+export { resolveUpstream, resolveProxyTimeoutMs };
 
 class HttpError extends Error {
   constructor(statusCode, message) {
@@ -37,21 +42,12 @@ async function readRequestBody(request, maxBodyBytes) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
-function parseNumber(input, fallback, { allowZero = false } = {}) {
-  if (input === undefined || input === null || input === '') return fallback;
-  const value = Number.parseInt(String(input), 10);
-  if (!Number.isInteger(value) || value < 0 || (!allowZero && value === 0)) {
-    throw new Error(`invalid numeric value: ${input}`);
-  }
-  return value;
-}
-
 export function resolvePort(input = process.env.HEADROOM_LITE_PORT ?? process.env.PORT) {
-  return parseNumber(input, DEFAULT_PORT);
+  return parseIntOption(input, DEFAULT_PORT);
 }
 
 export function resolveMaxBodyBytes(input = process.env.HEADROOM_LITE_MAX_BODY_BYTES) {
-  return parseNumber(input, DEFAULT_MAX_BODY_BYTES);
+  return parseIntOption(input, DEFAULT_MAX_BODY_BYTES);
 }
 
 async function handleCompress(request, response, { maxBodyBytes }) {
@@ -88,8 +84,9 @@ async function routeRequest(request, response, options) {
     writeJson(response, 200, {
       status: 'ok',
       service: 'headroom-lite',
-      mode: 'deterministic',
+      mode: options.upstream ? 'proxy+deterministic' : 'deterministic',
       max_body_bytes: options.maxBodyBytes,
+      upstream: options.upstream ?? null,
     });
     return;
   }
@@ -107,12 +104,18 @@ async function routeRequest(request, response, options) {
     return;
   }
 
+  // Transparent passthrough proxy — only active when upstream is configured
+  if (options.upstream) {
+    proxyRequest(request, response, { upstream: options.upstream, timeoutMs: options.proxyTimeoutMs });
+    return;
+  }
+
   writeJson(response, 404, { error: 'not found' });
 }
 
-export function createServer({ maxBodyBytes = resolveMaxBodyBytes() } = {}) {
+export function createServer({ maxBodyBytes = resolveMaxBodyBytes(), upstream = null, proxyTimeoutMs = resolveProxyTimeoutMs() } = {}) {
   const server = http.createServer((request, response) => {
-    routeRequest(request, response, { maxBodyBytes }).catch((error) => {
+    routeRequest(request, response, { maxBodyBytes, upstream, proxyTimeoutMs }).catch((error) => {
       if (error instanceof HttpError) {
         writeJson(response, error.statusCode, { error: error.message });
         return;
@@ -134,8 +137,10 @@ export function startServer({
   host = process.env.HEADROOM_LITE_HOST ?? DEFAULT_HOST,
   port = resolvePort(),
   maxBodyBytes = resolveMaxBodyBytes(),
+  upstream = resolveUpstream(),
+  proxyTimeoutMs = resolveProxyTimeoutMs(),
 } = {}) {
-  const server = createServer({ maxBodyBytes });
+  const server = createServer({ maxBodyBytes, upstream, proxyTimeoutMs });
 
   return new Promise((resolve, reject) => {
     server.once('error', reject);
