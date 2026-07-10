@@ -63,6 +63,7 @@ describe('HTTP server', () => {
       service: 'headroom-lite',
       mode: 'deterministic',
       max_body_bytes: 1024 * 1024,
+      upstream: null,
     });
     assert.deepEqual(await livez.json(), {
       status: 'alive',
