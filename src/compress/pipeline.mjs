@@ -40,7 +40,10 @@ const SAFE_TEXT_KEYS = new Set([
   'message',
 ]);
 
-const MAX_ADAPTIVE_SIZER_ITEMS = 256;
+// `computeOptimalK()` stays O(n^2) on diverse inputs. On a local adversarial
+// corpus (~19KB per item), the slow path was already ~0.45s at 9-10 items and
+// crossed ~0.50s by 12 items, so counts >= 10 stay on the fixed fallback.
+const MAX_ADAPTIVE_SIZER_ITEMS = 10;
 const PROTECT_RECENT_AT_MEDIUM = 1;
 const MIN_ADAPTIVE_RECENT = 2;
 const MAX_ADAPTIVE_RECENT = 5;
@@ -200,7 +203,7 @@ function chooseProtectedHistoricalMessages(candidates, latestMessageIndex) {
 
   let protectRecentCount = PROTECT_RECENT_AT_MEDIUM;
   if (count > 8) {
-    if (count > MAX_ADAPTIVE_SIZER_ITEMS) {
+    if (count >= MAX_ADAPTIVE_SIZER_ITEMS) {
       protectRecentCount = MAX_ADAPTIVE_RECENT;
     } else {
       protectRecentCount = computeOptimalK(historicalEntries.map(({ text }) => text), {

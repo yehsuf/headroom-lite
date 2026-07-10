@@ -144,7 +144,7 @@ function validateWithZlib(items, k, maxK, tolerance = 0.15) {
   if (k >= items.length || k >= maxK) return k;
 
   const fullText = Buffer.from(items.join('\n'));
-  const subsetText = Buffer.from(items.slice(0, k).join('\n'));
+  const subsetText = Buffer.from(items.slice(-k).join('\n'));
   if (fullText.length < 200) return k;
 
   const fullCompressed = deflateSync(fullText, { level: 1 }).length;
