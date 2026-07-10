@@ -73,6 +73,32 @@ describe('HTTP server', () => {
     });
   });
 
+  it('serves /stats endpoint with counters', async () => {
+    const r = await fetch(`${baseUrl}/stats`);
+    assert.equal(r.status, 200);
+    const body = await r.json();
+    assert.equal(body.status, 'ok');
+    assert.equal(body.service, 'headroom-lite');
+    assert.ok(typeof body.uptime_seconds === 'number' && body.uptime_seconds >= 0);
+    assert.ok(typeof body.proxy_requests === 'number');
+    assert.ok(typeof body.compress_requests === 'number');
+    assert.ok(typeof body.compress_tokens_before === 'number');
+    assert.ok(typeof body.compress_tokens_after === 'number');
+    assert.ok(typeof body.compress_tokens_saved === 'number');
+    assert.ok(typeof body.compress_pct === 'string');
+  });
+
+  it('/stats compress_requests increments after /v1/compress call', async () => {
+    const before = await (await fetch(`${baseUrl}/stats`)).json();
+    await fetch(`${baseUrl}/v1/compress`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    const after = await (await fetch(`${baseUrl}/stats`)).json();
+    assert.equal(after.compress_requests, before.compress_requests + 1);
+  });
+
   it('compresses a conversation via the /v1/compress contract', async () => {
     const payload = {
       format: 'openai',
