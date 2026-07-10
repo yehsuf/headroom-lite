@@ -4,6 +4,41 @@
 
 It exists for environments where a security review rejected model-scored prompt compression, but the deterministic parts of the idea were still useful.
 
+## Installation
+
+headroom-lite is published as a GitHub Package. Install via npm:
+
+```bash
+npm install -g @yehsuf/headroom-lite
+```
+
+Or pin to a version:
+```bash
+npm install -g @yehsuf/headroom-lite@0.3.0
+```
+
+Requires a GitHub token with `read:packages` permission:
+```bash
+echo "//npm.pkg.github.com/:_authToken=YOUR_TOKEN" >> ~/.npmrc
+echo "@yehsuf:registry=https://npm.pkg.github.com" >> ~/.npmrc
+```
+
+### Running as a service
+
+```bash
+# Start the proxy/sidecar
+headroom-lite
+
+# Configure upstream provider
+HEADROOM_LITE_UPSTREAM=https://api.anthropic.com headroom-lite
+
+# Point Claude Code at it
+ANTHROPIC_BASE_URL=http://127.0.0.1:8790 claude
+
+# Health check
+curl http://127.0.0.1:8790/health
+```
+
 ## Why this exists
 
 Some Headroom deployments are flagged not because *all* compression is risky, but because one ML-backed compression path can silently pull an unreviewed third-party model and use it to rewrite prompt content.
