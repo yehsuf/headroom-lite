@@ -26,16 +26,19 @@ echo "@yehsuf:registry=https://npm.pkg.github.com" >> ~/.npmrc
 ### Running as a service
 
 ```bash
-# Start the proxy/sidecar
-headroom-lite
-
-# Configure upstream provider
+# Single-provider (legacy mode — unchanged from v0.3.0)
 HEADROOM_LITE_UPSTREAM=https://api.anthropic.com headroom-lite
 
-# Point Claude Code at it
+# Multi-provider — each provider gets its own upstream
+HEADROOM_LITE_UPSTREAM_ANTHROPIC=https://api.anthropic.com \
+HEADROOM_LITE_UPSTREAM_OPENAI=https://api.openai.com \
+HEADROOM_LITE_UPSTREAM_GITHUB_MODELS=https://models.github.ai/inference \
+headroom-lite
+
+# Point Claude Code at it (Anthropic path)
 ANTHROPIC_BASE_URL=http://127.0.0.1:8790 claude
 
-# Health check
+# Health check — now reports the full upstreams map
 curl http://127.0.0.1:8790/health
 ```
 
@@ -106,6 +109,46 @@ Environment variables:
 - `HEADROOM_LITE_HOST` — listener host (default `127.0.0.1`)
 - `HEADROOM_LITE_MAX_BODY_BYTES` — max accepted request body size in bytes (default `5242880`)
 
+### Provider routing
+
+headroom-lite routes proxy requests by URL path. Each provider has a dedicated upstream env var; all fall back to the legacy `HEADROOM_LITE_UPSTREAM` if the specific var is unset.
+
+| Provider | Path pattern | Format | Env var |
+|---|---|---|---|
+| Anthropic | `/v1/messages*`, `/v1/complete*` | `anthropic` | `HEADROOM_LITE_UPSTREAM_ANTHROPIC` |
+| OpenAI | `/v1/chat/completions`, `/v1/responses*` | `openai` | `HEADROOM_LITE_UPSTREAM_OPENAI` |
+| GitHub Models (root) | `/chat/completions*` | `openai` | `HEADROOM_LITE_UPSTREAM_GITHUB_MODELS` |
+| GitHub Models (Azure) | `/openai/deployments/{id}/chat/completions` | `openai` | `HEADROOM_LITE_UPSTREAM_GITHUB_MODELS` |
+| Legacy fallback | any path | — | `HEADROOM_LITE_UPSTREAM` |
+
+**Precedence:** provider-specific var > legacy `HEADROOM_LITE_UPSTREAM` > 404.
+
+**Auth invariant (non-negotiable):** `Authorization`, `x-api-key`, and all other auth headers are forwarded **byte-for-byte** to the upstream. headroom-lite never reads, classifies, or rewrites them. Routing is path-only.
+
+**`format` field for `/v1/compress` callers:** Anthropic callers must send `"format": "anthropic"` to preserve cache-anchor logic. OpenAI / GitHub Models callers should send `"format": "openai"` (disables frozen-prefix protection, which is Anthropic-only). The field defaults to `"anthropic"` when absent.
+
+### Proxy compression (`HEADROOM_LITE_COMPRESS_PROXY`)
+
+When `HEADROOM_LITE_COMPRESS_PROXY=true`, headroom-lite reads and compresses JSON request bodies before forwarding them. SSE responses are always raw byte-piped regardless of this flag.
+
+### Live-zone compression (`HEADROOM_LITE_COMPRESS=live`)
+
+> **Power-user override. Read this before enabling.**
+
+By default, the most recent message in the conversation is never lossy-compressed (preserves TTFT quality and context freshness). Setting `HEADROOM_LITE_COMPRESS=live` removes this protection — every message in the live zone becomes eligible for cross-turn deduplication and adaptive compaction.
+
+**What live mode still protects (always, regardless of this flag):**
+- Anthropic frozen-prefix messages (cache_control markers) — byte-exact pass-through
+- `system` and `developer` role messages — never lossy
+- Tool argument payloads, signed content, cache_control subtrees
+
+```bash
+# Enable live-zone compression
+HEADROOM_LITE_COMPRESS=live headroom-lite
+```
+
+Any value other than `live` (including `safe`, `true`, or absent) uses the default protected mode.
+
 ## HTTP API
 
 ### `POST /v1/compress`
@@ -147,7 +190,7 @@ curl -s http://127.0.0.1:8790/v1/compress \
 
 ### `GET /health`
 
-Readiness-style JSON response.
+Readiness-style JSON response. Includes `upstreams` map (all four slots) and `compress_live` flag.
 
 ### `GET /livez`
 
@@ -174,8 +217,9 @@ Those limitations are also tracked in [CHANGELOG.md](./CHANGELOG.md).
 
 ## Roadmap summary
 
-- **Phase 1:** deterministic `/v1/compress` sidecar — built now
-- **Phase 2:** full provider-facing proxy with cache-aligned prefix freezing and careful auth passthrough
+- **Phase 1:** deterministic `/v1/compress` sidecar — built
+- **Phase 2:** full provider-facing proxy with cache-aligned prefix freezing and careful auth passthrough — built
+- **Phase 2.1:** multi-provider routing (Anthropic, OpenAI, GitHub Models) — built
 - **Phase 3:** optional standalone BM25 tool filtering and ast-grep-based large tool-result outlining
 
 Details: [ROADMAP.md](./ROADMAP.md)
