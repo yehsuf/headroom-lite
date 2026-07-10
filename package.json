@@ -1,12 +1,31 @@
 {
-  "name": "headroom-lite",
-  "version": "0.1.0",
-  "description": "Deterministic, zero-ML context compression sidecar compatible with Headroom's /v1/compress contract.",
+  "name": "@yehsuf/headroom-lite",
+  "version": "0.3.0",
+  "description": "Deterministic, zero-ML context compression proxy — infosec-safe Headroom replacement",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yehsuf/headroom-lite.git"
+  },
+  "keywords": [
+    "llm",
+    "compression",
+    "proxy",
+    "anthropic",
+    "openai",
+    "cache",
+    "headroom"
+  ],
   "bin": {
     "headroom-lite": "./src/index.mjs"
   },
+  "files": [
+    "src/",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "node src/index.mjs",
     "test": "node --test test/**/*.test.mjs",
@@ -14,5 +33,9 @@
   },
   "engines": {
     "node": ">=20.0.0"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "access": "restricted"
   }
 }
