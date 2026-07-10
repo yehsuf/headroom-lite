@@ -39,4 +39,30 @@ describe('estimate tokens', () => {
     const expected = estimateTokenCount('hello there') + estimateTokenCount('tool finished');
     assert.equal(estimateMessageTokens(messages), expected);
   });
+
+  it('excludes object-valued tool input/arguments from the estimate', () => {
+    const opaqueToolPayload = Array.from(
+      { length: 8 },
+      () => 'line1 // repeated tool payload content that must remain byte exact',
+    ).join('\n') + '\n';
+
+    const messages = [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'short text' },
+          {
+            type: 'tool_use',
+            name: 'write_file',
+            input: { path: 'foo.py', file_text: opaqueToolPayload },
+            arguments: { path: 'foo.py', file_text: opaqueToolPayload },
+          },
+        ],
+      },
+    ];
+
+    // Only "short text" should count - the object-valued input/arguments
+    // must be fully excluded, not just their string-shaped equivalents.
+    assert.equal(estimateMessageTokens(messages), estimateTokenCount('short text'));
+  });
 });

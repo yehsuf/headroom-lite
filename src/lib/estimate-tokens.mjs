@@ -9,7 +9,8 @@
  */
 const TOKENISH_RE = /[\p{L}\p{N}_]+|[^\s]/gu;
 const WORDISH_RE = /^[\p{L}\p{N}_]+$/u;
-const SKIP_SUBTREES = new Set(['cache_control', 'signature']);
+const SKIP_MUTATION_KEYS = new Set(['arguments', 'input', 'partial_json', 'input_json']);
+const SKIP_SUBTREES = new Set(['cache_control', 'signature', ...SKIP_MUTATION_KEYS]);
 const SKIP_TEXT_KEYS = new Set([
   'role',
   'type',
@@ -23,7 +24,6 @@ const SKIP_TEXT_KEYS = new Set([
   'status',
   'mime_type',
 ]);
-const SKIP_MUTATION_KEYS = new Set(['arguments', 'input', 'partial_json', 'input_json']);
 const SAFE_TEXT_KEYS = new Set([
   'content',
   'text',
