@@ -190,3 +190,42 @@ describe('DriftDetector — server integration', () => {
     assert.ok('prev_hash' in body.cache_drift);
   });
 });
+
+describe('DriftDetector — session cap and validation', () => {
+  it('throws on empty session_id', () => {
+    const d = new DriftDetector();
+    assert.throws(() => d.check('', {}), /non-empty string/);
+  });
+
+  it('throws on session_id longer than 256 chars', () => {
+    const d = new DriftDetector();
+    assert.throws(() => d.check('x'.repeat(257), {}), /256/);
+  });
+
+  it('accepts session_id of exactly 256 chars', () => {
+    const d = new DriftDetector();
+    assert.doesNotThrow(() => d.check('a'.repeat(256), {}));
+  });
+
+  it('evicts oldest session when maxSessions cap is reached', () => {
+    const d = new DriftDetector({ maxSessions: 3 });
+    d.check('sess-a', { messages: [] });
+    d.check('sess-b', { messages: [] });
+    d.check('sess-c', { messages: [] });
+    assert.equal(d.sessionCount, 3);
+
+    // Adding a 4th session should evict the oldest (sess-a)
+    d.check('sess-d', { messages: [] });
+    assert.equal(d.sessionCount, 3);
+
+    // sess-d is new so next call should be 'stable' (already stored)
+    const r = d.check('sess-d', { messages: [] });
+    assert.equal(r.status, 'stable');
+  });
+
+  it('session count does not exceed maxSessions after many inserts', () => {
+    const d = new DriftDetector({ maxSessions: 5 });
+    for (let i = 0; i < 20; i++) d.check(`s${i}`, { messages: [] });
+    assert.ok(d.sessionCount <= 5);
+  });
+});
