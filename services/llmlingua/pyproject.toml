@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "headroom-lingua-service"
+version = "0.1.0"
+description = "LLMLingua compression microservice for headroom-lite"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+llmlingua2 = ["llmlingua>=0.2.0"]
+securitylingua = ["llmlingua>=0.2.0"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+headroom-lingua = "headroom_lingua_service.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["headroom_lingua_service*"]
