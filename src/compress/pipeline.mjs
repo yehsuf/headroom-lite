@@ -6,6 +6,7 @@ import {
 } from './cross-turn-dedup.mjs';
 import { computeFrozenCount } from './frozen-prefix.mjs';
 import { compactLossless } from './lossless-compaction.mjs';
+import { withTagProtection } from './tag-protector.mjs';
 import { estimateMessageTokens } from '../lib/estimate-tokens.mjs';
 
 const SEARCH_ROW_RE = /^[^\n:]+:\d+:.*$/m;
@@ -78,18 +79,13 @@ function detectPrimaryCompactionKind(text) {
 }
 
 export function compactMessageText(text) {
-  let output = text;
-  const primaryKind = detectPrimaryCompactionKind(text);
-
-  if (primaryKind !== null) {
-    output = compactLossless(output, primaryKind);
-  }
-
-  if (output.includes('\n') && primaryKind !== 'log') {
-    output = compactLossless(output, 'text');
-  }
-
-  return output;
+  return withTagProtection(text, (safeText) => {
+    let output = safeText;
+    const primaryKind = detectPrimaryCompactionKind(safeText);
+    if (primaryKind !== null) output = compactLossless(output, primaryKind);
+    if (output.includes('\n') && primaryKind !== 'log') output = compactLossless(output, 'text');
+    return output;
+  });
 }
 
 function shouldVisitText(text, key, parentKey) {
