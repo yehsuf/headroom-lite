@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.myelin.llmlingua</string>
+  <key>ProgramArguments</key>
+  <array>
+    <!-- Replace with your actual Python path: `which python3` -->
+    <string>/Users/ysufrin/.nvm/versions/node/v18.20.8/bin/python3</string>
+    <string>-m</string>
+    <string>headroom_lingua_service</string>
+    <string>--port</string>
+    <string>8791</string>
+    <string>--backend</string>
+    <string>llmlingua2</string>
+    <string>--log-level</string>
+    <string>INFO</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HEADROOM_LITE_LOSSY_BACKEND</key>
+    <string>llmlingua2</string>
+    <key>HEADROOM_LITE_LOSSY_MODEL</key>
+    <string>microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank</string>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/ysufrin/.myelin/llmlingua.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/ysufrin/.myelin/llmlingua.log</string>
+  <key>WorkingDirectory</key>
+  <string>/Users/ysufrin/Work/headroom-lite/services/llmlingua</string>
+</dict>
+</plist>
