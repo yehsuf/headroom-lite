@@ -239,17 +239,21 @@ export function compressMessages(messages, { format = 'anthropic', model = 'defa
   const tokensBefore = estimateMessageTokens(messages);
 
   const outputLive = structuredClone(live);
-
-  // Phase 1: compact JSON arrays in tool_result blocks (before text leaf walk
-  // so the resulting CSV strings are not re-processed by lossless compaction).
   const latestMessageIndex = outputLive.length - 1;
-  compactToolOutputs(outputLive, latestMessageIndex);
 
+  // Phase 1: text-leaf compaction (diffs, logs, search results, JSON minification).
   const leaves = collectTextLeaves(outputLive);
-
   for (const leaf of leaves) {
     leaf.set(compactMessageText(leaf.get()));
   }
+
+  // Phase 2: JSON array → CSV compaction for tool_result blocks.
+  // Runs AFTER the text-leaf loop so the generated CSV strings are never
+  // re-encountered by compactMessageText. Running before would cause
+  // PATH_ROW_RE to match CSV rows like "src/a.mjs,0" (comma is not excluded),
+  // triggering pathHeading which strips shared directory prefixes and corrupts
+  // the CSV output (e.g. "src/" appears as a separate heading line).
+  compactToolOutputs(outputLive, latestMessageIndex);
 
   const lossyCandidates = leaves.filter((leaf) => isLossyEligibleLeaf(leaf, latestMessageIndex, compressLive));
 

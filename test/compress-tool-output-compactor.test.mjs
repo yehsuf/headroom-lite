@@ -259,3 +259,49 @@ describe('compactToolOutputs', () => {
     assert.equal(cloned[0].content, small, 'small array must not be compacted');
   });
 });
+
+// ── Full pipeline regression: pathHeading must not corrupt CSV rows ───────────
+
+describe('compressMessages pipeline — file-listing tool output', () => {
+  it('CSV rows are not processed by pathHeading after compactToolOutputs', async () => {
+    const { compressMessages } = await import('../src/compress/pipeline.mjs');
+
+    // Build a file-listing tool result large enough to trigger CSV compaction (>MIN_ITEMS)
+    const files = Array.from({ length: 20 }, (_, i) => ({
+      file: `src/module${i}.mjs`,
+      size: i * 512,
+    }));
+    const toolResultText = JSON.stringify(files);
+
+    const messages = [
+      { role: 'user', content: 'list files' },
+      {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'id1',
+          content: [{ type: 'text', text: toolResultText }],
+        }],
+      },
+      { role: 'assistant', content: 'done' },
+    ];
+
+    const { messages: out } = compressMessages(messages);
+    const resultText = out[1].content[0].content[0].text;
+
+    // Must be CSV-schema form
+    assert.match(resultText, /^schema:\[/, 'should be CSV-schema');
+
+    // CRITICAL: each data row must still contain the full path (e.g. "src/module0.mjs")
+    // pathHeading corruption would strip "src/" to a separate heading line
+    const lines = resultText.split('\n');
+    const dataRows = lines.slice(1); // skip schema header
+    for (const row of dataRows) {
+      assert.doesNotMatch(row, /^src\/$/, `pathHeading must not strip "src/" to its own line; got: ${row}`);
+      if (row.startsWith('src/')) {
+        // full path preserved in row value
+        assert.match(row, /src\/module\d+\.mjs/, `row should contain full path: ${row}`);
+      }
+    }
+  });
+});
