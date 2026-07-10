@@ -10,8 +10,14 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-llmlingua2 = ["llmlingua>=0.2.0"]
-securitylingua = ["llmlingua>=0.2.0"]
+llmlingua2 = [
+    "llmlingua==0.2.2",
+    "torch>=2.1",
+]
+securitylingua = [
+    "llmlingua @ git+https://github.com/microsoft/LLMLingua.git",
+    "torch>=2.1",
+]
 dev = ["pytest>=7.0"]
 
 [project.scripts]
