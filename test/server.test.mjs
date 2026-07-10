@@ -64,6 +64,7 @@ describe('HTTP server', () => {
       mode: 'deterministic',
       max_body_bytes: 1024 * 1024,
       upstream: null,
+      upstreams: { legacy: null, anthropic: null, openai: null, 'github-models': null },
     });
     assert.deepEqual(await livez.json(), {
       status: 'alive',

@@ -6,6 +6,8 @@ import { proxyRequest, proxyCompressedRequest, resolveUpstream, resolveProxyTime
 import { parseIntOption } from './lib/config.mjs';
 import { DriftDetector } from './analyze/drift-detector.mjs';
 import { injectOpenAICacheKey, resolveOpenAICacheKey } from './normalize/openai-cache-key.mjs';
+import { detectProvider } from './providers/detect.mjs';
+import { resolveUpstreams, selectUpstream } from './providers/upstreams.mjs';
 
 const driftDetector = new DriftDetector();
 
@@ -118,12 +120,17 @@ async function routeRequest(request, response, options) {
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? '127.0.0.1'}`);
 
   if (method === 'GET' && url.pathname === '/health') {
+    // Check whether any upstream is configured
+    const { upstreams } = options;
+    const anyUpstream = upstreams.legacy ?? upstreams.anthropic ?? upstreams.openai ?? upstreams['github-models'];
     writeJson(response, 200, {
       status: 'ok',
       service: 'headroom-lite',
-      mode: options.upstream ? 'proxy+deterministic' : 'deterministic',
+      mode: anyUpstream ? 'proxy+deterministic' : 'deterministic',
       max_body_bytes: options.maxBodyBytes,
-      upstream: options.upstream ?? null,
+      // legacy field kept for one release for backward compat with existing scrapers
+      upstream: upstreams.legacy,
+      upstreams,
     });
     return;
   }
@@ -141,11 +148,14 @@ async function routeRequest(request, response, options) {
     return;
   }
 
-  // Transparent passthrough proxy — only active when upstream is configured
-  if (options.upstream) {
+  // Transparent passthrough proxy — route to the provider-specific upstream, fall back to legacy.
+  const { provider } = detectProvider(url.pathname);
+  const chosenUpstream = selectUpstream(options.upstreams, provider);
+
+  if (chosenUpstream) {
     if (options.compressProxy) {
       proxyCompressedRequest(request, response, {
-        upstream: options.upstream,
+        upstream: chosenUpstream,
         timeoutMs: options.proxyTimeoutMs,
         maxBodyBytes: options.maxBodyBytes,
       }).catch(() => {
@@ -161,7 +171,7 @@ async function routeRequest(request, response, options) {
         }
       });
     } else {
-      proxyRequest(request, response, { upstream: options.upstream, timeoutMs: options.proxyTimeoutMs });
+      proxyRequest(request, response, { upstream: chosenUpstream, timeoutMs: options.proxyTimeoutMs });
     }
     return;
   }
@@ -169,9 +179,23 @@ async function routeRequest(request, response, options) {
   writeJson(response, 404, { error: 'not found' });
 }
 
-export function createServer({ maxBodyBytes = resolveMaxBodyBytes(), upstream = null, proxyTimeoutMs = resolveProxyTimeoutMs(), compressProxy = resolveCompressProxy() } = {}) {
+export function createServer({
+  maxBodyBytes = resolveMaxBodyBytes(),
+  upstream = null,     // legacy single-upstream (backward compat) — wrapped into upstreams.legacy
+  upstreams = null,    // new: full provider map; takes precedence over upstream
+  proxyTimeoutMs = resolveProxyTimeoutMs(),
+  compressProxy = resolveCompressProxy(),
+} = {}) {
+  // Synthesize the upstreams map: explicit map beats legacy single-upstream.
+  const resolvedUpstreams = upstreams ?? {
+    legacy: upstream,
+    anthropic: null,
+    openai: null,
+    'github-models': null,
+  };
+
   const server = http.createServer((request, response) => {
-    routeRequest(request, response, { maxBodyBytes, upstream, proxyTimeoutMs, compressProxy }).catch((error) => {
+    routeRequest(request, response, { maxBodyBytes, upstreams: resolvedUpstreams, proxyTimeoutMs, compressProxy }).catch((error) => {
       if (error instanceof HttpError) {
         writeJson(response, error.statusCode, { error: error.message });
         return;
@@ -193,11 +217,25 @@ export function startServer({
   host = process.env.HEADROOM_LITE_HOST ?? DEFAULT_HOST,
   port = resolvePort(),
   maxBodyBytes = resolveMaxBodyBytes(),
-  upstream = resolveUpstream(),
+  upstream = undefined,    // legacy: explicit single URL — wrapped as upstreams.legacy
+  upstreams = undefined,   // new: explicit provider map
   proxyTimeoutMs = resolveProxyTimeoutMs(),
   compressProxy = resolveCompressProxy(),
 } = {}) {
-  const server = createServer({ maxBodyBytes, upstream, proxyTimeoutMs, compressProxy });
+  // Resolution priority:
+  //   1. Explicit upstreams map (caller provided full map)
+  //   2. Explicit upstream string (caller provided legacy single URL)
+  //   3. Load everything from env (default startup path)
+  let resolvedUpstreams;
+  if (upstreams !== undefined) {
+    resolvedUpstreams = upstreams;
+  } else if (upstream !== undefined) {
+    resolvedUpstreams = { legacy: upstream, anthropic: null, openai: null, 'github-models': null };
+  } else {
+    resolvedUpstreams = resolveUpstreams();
+  }
+
+  const server = createServer({ maxBodyBytes, upstreams: resolvedUpstreams, proxyTimeoutMs, compressProxy });
 
   return new Promise((resolve, reject) => {
     server.once('error', reject);
