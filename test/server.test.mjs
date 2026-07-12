@@ -46,6 +46,18 @@ function ledgerPath(name = 'stats.json') {
   return join(ARTIFACT_ROOT, name);
 }
 
+function createClock(initialValue = '2026-01-01T00:00:00.000Z') {
+  let current = new Date(initialValue);
+  return {
+    now() {
+      return new Date(current);
+    },
+    set(value) {
+      current = new Date(value);
+    },
+  };
+}
+
 async function importFreshServerModule(homeDirectory, tag) {
   mkdirSync(homeDirectory, { recursive: true });
   const previousHome = process.env.HOME;
@@ -258,6 +270,65 @@ describe('HTTP server', () => {
     assert.equal(afterSuccess.session.compression.requests, before.session.compression.requests + 1);
     const history = await (await fetch(`${baseUrl}/stats-history?series=hourly`)).json();
     assert.ok(history.rows.some((row) => row.series === 'compression.requests' && row.value >= 1));
+  });
+
+  it('coalesces persisted and pending hourly history rows into one canonical row', async () => {
+    const clock = createClock('2026-01-01T00:05:00.000Z');
+    const coalescedLedger = createTelemetryLedger({
+      path: ledgerPath('coalesced-hourly.json'),
+      now: clock.now,
+    });
+    const firstServer = await startServer({
+      host: '127.0.0.1',
+      port: 0,
+      maxBodyBytes: 1024 * 1024,
+      telemetryLedger: coalescedLedger,
+    });
+    const firstAddress = firstServer.address();
+
+    try {
+      const first = await fetch(`http://127.0.0.1:${firstAddress.port}/v1/compress`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'first' }] }),
+      });
+      assert.equal(first.status, 200);
+    } finally {
+      clock.set('2026-01-01T00:15:00.000Z');
+      await closeServer(firstServer);
+    }
+
+    const secondServer = await startServer({
+      host: '127.0.0.1',
+      port: 0,
+      maxBodyBytes: 1024 * 1024,
+      telemetryLedger: coalescedLedger,
+    });
+    const secondAddress = secondServer.address();
+
+    try {
+      clock.set('2026-01-01T00:45:00.000Z');
+      const second = await fetch(`http://127.0.0.1:${secondAddress.port}/v1/compress`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'second' }] }),
+      });
+      assert.equal(second.status, 200);
+
+      const history = await (await fetch(`http://127.0.0.1:${secondAddress.port}/stats-history?series=hourly`)).json();
+      assert.deepEqual(
+        history.rows.filter((row) => row.series === 'compression.requests'),
+        [
+          {
+            series: 'compression.requests',
+            bucket_start: '2026-01-01T00:00:00.000Z',
+            value: 2,
+          },
+        ],
+      );
+    } finally {
+      await closeServer(secondServer);
+    }
   });
 
   it('serves csv stats history and rejects unsupported history queries', async () => {
@@ -631,6 +702,53 @@ describe('HTTP server', () => {
     } finally {
       await closeServer(firstServer);
       await closeServer(secondServer);
+    }
+  });
+
+  it('preserves default telemetry lifetime after shared-home servers close out of order', async () => {
+    const defaultHome = join(ARTIFACT_ROOT, `default-home-persist-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const tag = `default-persist-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const { startServer: startDefaultServer } = await importFreshServerModule(defaultHome, tag);
+    const firstServer = await startDefaultServer({
+      host: '127.0.0.1',
+      port: 0,
+      maxBodyBytes: 1024 * 1024,
+    });
+    const secondServer = await startDefaultServer({
+      host: '127.0.0.1',
+      port: 0,
+      maxBodyBytes: 1024 * 1024,
+    });
+    const firstAddress = firstServer.address();
+
+    try {
+      const compress = await fetch(`http://127.0.0.1:${firstAddress.port}/v1/compress`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'survive-shared-close' }] }),
+      });
+      assert.equal(compress.status, 200);
+    } finally {
+      await closeServer(firstServer);
+      await closeServer(secondServer);
+    }
+
+    const thirdServer = await startDefaultServer({
+      host: '127.0.0.1',
+      port: 0,
+      maxBodyBytes: 1024 * 1024,
+    });
+    const thirdAddress = thirdServer.address();
+
+    try {
+      const stats = await (await fetch(`http://127.0.0.1:${thirdAddress.port}/stats`)).json();
+      assert.equal(stats.lifetime.compression.requests, 1);
+      assert.equal(stats.session.compression.requests, 0);
+
+      const history = await (await fetch(`http://127.0.0.1:${thirdAddress.port}/stats-history?series=hourly`)).json();
+      assert.ok(history.rows.some((row) => row.series === 'compression.requests' && row.value >= 1));
+    } finally {
+      await closeServer(thirdServer);
     }
   });
 });

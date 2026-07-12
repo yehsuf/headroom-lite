@@ -138,6 +138,66 @@ function cloneAggregate(source = createAggregate()) {
   return aggregate;
 }
 
+function addCountMap(target, delta) {
+  for (const [key, value] of Object.entries(delta ?? {})) {
+    const count = normalizeNumber(value);
+    if (count > 0) target[key] = (target[key] ?? 0) + count;
+  }
+}
+
+function addAggregate(target, delta) {
+  target.compression.requests += normalizeNumber(delta?.compression?.requests);
+  target.compression.tokens_before += normalizeNumber(delta?.compression?.tokens_before);
+  target.compression.tokens_after += normalizeNumber(delta?.compression?.tokens_after);
+  target.compression.tokens_saved += normalizeNumber(delta?.compression?.tokens_saved);
+  target.compression.latency_ms += normalizeNumber(delta?.compression?.latency_ms);
+  addCountMap(target.compression.outcomes, delta?.compression?.outcomes);
+  addCountMap(target.compression.providers, delta?.compression?.providers);
+  addCountMap(target.compression.models, delta?.compression?.models);
+
+  target.proxy.requests += normalizeNumber(delta?.proxy?.requests);
+  target.proxy.latency_ms += normalizeNumber(delta?.proxy?.latency_ms);
+  addCountMap(target.proxy.outcomes, delta?.proxy?.outcomes);
+  addCountMap(target.proxy.providers, delta?.proxy?.providers);
+  addCountMap(target.proxy.models, delta?.proxy?.models);
+  return target;
+}
+
+function diffCountMap(current, previous) {
+  const delta = {};
+  const keys = new Set([
+    ...Object.keys(current ?? {}),
+    ...Object.keys(previous ?? {}),
+  ]);
+  for (const key of keys) {
+    const value = Math.max(0, normalizeNumber(current?.[key]) - normalizeNumber(previous?.[key]));
+    if (value > 0) delta[key] = value;
+  }
+  return delta;
+}
+
+function diffAggregate(current, previous = createAggregate()) {
+  return {
+    compression: {
+      requests: Math.max(0, normalizeNumber(current?.compression?.requests) - normalizeNumber(previous?.compression?.requests)),
+      tokens_before: Math.max(0, normalizeNumber(current?.compression?.tokens_before) - normalizeNumber(previous?.compression?.tokens_before)),
+      tokens_after: Math.max(0, normalizeNumber(current?.compression?.tokens_after) - normalizeNumber(previous?.compression?.tokens_after)),
+      tokens_saved: Math.max(0, normalizeNumber(current?.compression?.tokens_saved) - normalizeNumber(previous?.compression?.tokens_saved)),
+      latency_ms: Math.max(0, normalizeNumber(current?.compression?.latency_ms) - normalizeNumber(previous?.compression?.latency_ms)),
+      outcomes: diffCountMap(current?.compression?.outcomes, previous?.compression?.outcomes),
+      providers: diffCountMap(current?.compression?.providers, previous?.compression?.providers),
+      models: diffCountMap(current?.compression?.models, previous?.compression?.models),
+    },
+    proxy: {
+      requests: Math.max(0, normalizeNumber(current?.proxy?.requests) - normalizeNumber(previous?.proxy?.requests)),
+      latency_ms: Math.max(0, normalizeNumber(current?.proxy?.latency_ms) - normalizeNumber(previous?.proxy?.latency_ms)),
+      outcomes: diffCountMap(current?.proxy?.outcomes, previous?.proxy?.outcomes),
+      providers: diffCountMap(current?.proxy?.providers, previous?.proxy?.providers),
+      models: diffCountMap(current?.proxy?.models, previous?.proxy?.models),
+    },
+  };
+}
+
 function createHistoryPoint(aggregate, capturedAt) {
   return {
     captured_at: capturedAt.toISOString(),
@@ -406,6 +466,7 @@ export function createTelemetryLedger({
   const state = {
     lifetime: cloneAggregate(loaded.lifetime),
     session: createAggregate(),
+    persistedSession: createAggregate(),
     historyBaseline: prunedHistory.baselinePoint,
     historyPoints: prunedHistory.points,
   };
@@ -544,14 +605,29 @@ export function createTelemetryLedger({
 
   function flush() {
     const capturedAt = new Date(now());
-    state.historyPoints.push(createHistoryPoint(state.lifetime, capturedAt));
-    const prunedHistory = pruneHistory(
-      state.historyPoints,
+    const latest = loadAggregateState(path);
+    const latestPrunedHistory = pruneHistory(
+      latest.historyPoints,
       capturedAt,
       historyLimit,
       historyAgeLimitMs,
-      state.historyBaseline,
+      latest.historyBaseline,
     );
+    const sessionDelta = diffAggregate(state.session, state.persistedSession);
+    const mergedLifetime = cloneAggregate(latest.lifetime);
+    addAggregate(mergedLifetime, sessionDelta);
+
+    const mergedHistoryPoints = latestPrunedHistory.points.slice();
+    mergedHistoryPoints.push(createHistoryPoint(mergedLifetime, capturedAt));
+    const prunedHistory = pruneHistory(
+      mergedHistoryPoints,
+      capturedAt,
+      historyLimit,
+      historyAgeLimitMs,
+      latestPrunedHistory.baselinePoint,
+    );
+    state.lifetime = mergedLifetime;
+    state.persistedSession = cloneAggregate(state.session);
     state.historyBaseline = prunedHistory.baselinePoint;
     state.historyPoints = prunedHistory.points;
 

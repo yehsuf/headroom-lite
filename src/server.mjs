@@ -205,13 +205,11 @@ function collectHistoryRows(telemetryLedger, resolution, snapshot, telemetryStat
     }
   }
   rows.push(...getPendingHistoryRows(telemetryState));
-  if (resolution === 'hourly') {
-    return rows.sort((left, right) => left.bucket_start.localeCompare(right.bucket_start) || left.series.localeCompare(right.series));
-  }
-
   const grouped = new Map();
   for (const row of rows) {
-    const bucketStart = bucketHistoryStart(row.bucket_start, resolution);
+    const bucketStart = resolution === 'hourly'
+      ? row.bucket_start
+      : bucketHistoryStart(row.bucket_start, resolution);
     const key = `${row.series}\u0000${bucketStart}`;
     grouped.set(key, (grouped.get(key) ?? 0) + row.value);
   }
@@ -251,29 +249,6 @@ function getPendingHistoryRows(telemetryState) {
       return { series, bucket_start, value };
     })
     .sort((left, right) => left.bucket_start.localeCompare(right.bucket_start) || left.series.localeCompare(right.series));
-}
-
-function nativeHistoryCsv(telemetryLedger, snapshot, telemetryState) {
-  if (!telemetryLedger || typeof telemetryLedger.toCsv !== 'function') {
-    return historyRowsToCsv(getPendingHistoryRows(telemetryState));
-  }
-  const seriesList = snapshot.history?.series ?? [];
-  if (seriesList.length === 0) {
-    return historyRowsToCsv(getPendingHistoryRows(telemetryState));
-  }
-
-  const firstCsv = telemetryLedger.toCsv({ series: seriesList[0] });
-  if (!firstCsv.startsWith('series,bucket_start,value')) {
-    return firstCsv;
-  }
-
-  const rows = firstCsv.trim().split('\n').slice(1).filter(Boolean);
-  for (const series of seriesList.slice(1)) {
-    const csv = telemetryLedger.toCsv({ series });
-    rows.push(...csv.trim().split('\n').slice(1).filter(Boolean));
-  }
-  rows.push(...getPendingHistoryRows(telemetryState).map((row) => `${row.series},${row.bucket_start},${row.value}`));
-  return ['series,bucket_start,value', ...rows].join('\n');
 }
 
 function flushTelemetry(telemetryLedger, telemetryState) {
@@ -573,14 +548,12 @@ async function routeRequest(request, response, options) {
     validateStatsHistoryQuery(url.searchParams);
     const format = normalizeHistoryFormat(url.searchParams.get('format') ?? 'json');
     const series = normalizeHistorySeries(url.searchParams.get('series') ?? 'history');
+    const rows = collectHistoryRows(options.telemetryLedger, series, telemetrySnapshot, options.telemetryState);
     if (format === 'csv') {
-      const body = series === 'hourly'
-        ? nativeHistoryCsv(options.telemetryLedger, telemetrySnapshot, options.telemetryState)
-        : historyRowsToCsv(collectHistoryRows(options.telemetryLedger, series, telemetrySnapshot, options.telemetryState));
+      const body = historyRowsToCsv(rows);
       writeText(response, 200, body, 'text/csv; charset=utf-8');
       return;
     }
-    const rows = collectHistoryRows(options.telemetryLedger, series, telemetrySnapshot, options.telemetryState);
     writeJson(response, 200, {
       schema_version: telemetrySnapshot.schema_version,
       status: 'ok',
