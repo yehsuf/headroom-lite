@@ -4,7 +4,7 @@ import { once } from 'node:events';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { after, before, describe, it } from 'node:test';
 import { strict as assert } from 'node:assert';
-import { mkdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { compressMessages } from '../src/compress/pipeline.mjs';
@@ -1017,6 +1017,41 @@ describe('HTTP server', () => {
     }
   });
 
+  it('keeps the default-path fallback when an explicit resolved default telemetry path cannot be created', async () => {
+    const defaultHome = join(ARTIFACT_ROOT, `default-home-readonly-explicit-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const tag = `default-readonly-explicit-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const restoreFs = patchReadOnlyDefaultTelemetryPath(defaultHome);
+    const explicitDefaultPath = join(defaultHome, '.headroom-lite', 'telemetry.json');
+    let server;
+
+    try {
+      const { createServer: createDefaultServer } = await importFreshServerModule(defaultHome, tag);
+      server = await listenServer(createDefaultServer({
+        maxBodyBytes: 1024 * 1024,
+        statsPathInput: explicitDefaultPath,
+      }));
+    } finally {
+      restoreFs();
+    }
+
+    const address = server.address();
+    try {
+      const [health, stats] = await Promise.all([
+        fetch(`http://127.0.0.1:${address.port}/health`),
+        fetch(`http://127.0.0.1:${address.port}/stats`),
+      ]);
+      assert.equal(health.status, 200);
+      assert.equal(stats.status, 200);
+
+      const healthBody = await health.json();
+      const statsBody = await stats.json();
+      assert.equal(healthBody.capabilities.persistence, false);
+      assert.equal(statsBody.capabilities.persistence, false);
+    } finally {
+      await closeServer(server);
+    }
+  });
+
   it('preserves default telemetry lifetime after shared-home servers close out of order', async () => {
     const defaultHome = join(ARTIFACT_ROOT, `default-home-persist-${Date.now()}-${Math.random().toString(16).slice(2)}`);
     const tag = `default-persist-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -1062,6 +1097,60 @@ describe('HTTP server', () => {
     } finally {
       await closeServer(thirdServer);
     }
+  });
+
+  it('expands ~/ stats paths into the home directory without creating a literal workspace tilde directory', async () => {
+    const defaultHome = join(ARTIFACT_ROOT, `default-home-tilde-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const tag = `default-tilde-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const literalWorkspaceTildeDir = join(__dirname, '..', '~');
+    const expandedStatsPath = join(defaultHome, '.headroom-lite', 'tilde-telemetry.json');
+
+    rmSync(literalWorkspaceTildeDir, { recursive: true, force: true });
+
+    await withEnv({
+      HOME: defaultHome,
+      HEADROOM_LITE_STATS_PATH: '~/.headroom-lite/tilde-telemetry.json',
+    }, async () => {
+      const { startServer: startDefaultServer, resolveStatsPath } = await importFreshServerModule(defaultHome, tag);
+      assert.equal(resolveStatsPath(), expandedStatsPath);
+
+      const firstServer = await startDefaultServer({
+        host: '127.0.0.1',
+        port: 0,
+        maxBodyBytes: 1024 * 1024,
+      });
+      const firstAddress = firstServer.address();
+
+      try {
+        const compress = await fetch(`http://127.0.0.1:${firstAddress.port}/v1/compress`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ messages: [{ role: 'user', content: 'tilde-path-persistence' }] }),
+        });
+        assert.equal(compress.status, 200);
+      } finally {
+        await closeServer(firstServer);
+      }
+
+      const secondServer = await startDefaultServer({
+        host: '127.0.0.1',
+        port: 0,
+        maxBodyBytes: 1024 * 1024,
+      });
+      const secondAddress = secondServer.address();
+
+      try {
+        const stats = await (await fetch(`http://127.0.0.1:${secondAddress.port}/stats`)).json();
+        assert.equal(stats.lifetime.compression.requests, 1);
+        assert.equal(stats.session.compression.requests, 0);
+        assert.equal(existsSync(expandedStatsPath), true);
+        assert.equal(existsSync(literalWorkspaceTildeDir), false);
+      } finally {
+        await closeServer(secondServer);
+      }
+    });
+
+    rmSync(literalWorkspaceTildeDir, { recursive: true, force: true });
   });
 
   it('falls back to an in-memory default telemetry ledger when startServer cannot create the default path', async () => {

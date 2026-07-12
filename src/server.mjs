@@ -359,13 +359,20 @@ function parseNonNegativeIntegerOption(input, envName, defaultValue) {
   return Number.parseInt(normalized, 10);
 }
 
+function normalizeStatsPath(path) {
+  if (path.startsWith('~/')) {
+    return join(homedir(), path.slice(2));
+  }
+  return path;
+}
+
 export function resolveStatsPath(input = process.env.HEADROOM_LITE_STATS_PATH) {
   if (input === undefined || input === null || input === '') return DEFAULT_TELEMETRY_PATH;
   const normalized = String(input).trim();
   if (!normalized) {
     throw new Error('HEADROOM_LITE_STATS_PATH must be a non-empty path');
   }
-  return normalized;
+  return normalizeStatsPath(normalized);
 }
 
 export function resolveStatsMaxPoints(input = process.env.HEADROOM_LITE_STATS_MAX_POINTS) {
@@ -387,7 +394,7 @@ function resolveConfiguredTelemetryLedger({
   const path = resolveStatsPath(statsPathInput);
   const maxHistoryPoints = resolveStatsMaxPoints(statsMaxPointsInput);
   const maxHistoryAgeMs = resolveStatsMaxAgeMs(statsMaxAgeDaysInput);
-  const usingDefaultPath = statsPathInput === undefined || statsPathInput === null || statsPathInput === '';
+  const usingDefaultPath = path === DEFAULT_TELEMETRY_PATH;
 
   try {
     return createTelemetryLedger({
