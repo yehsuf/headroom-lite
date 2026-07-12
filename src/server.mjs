@@ -1,4 +1,6 @@
 import http from 'node:http';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { compressMessages, compressMessagesAsync } from './compress/pipeline.mjs';
 import { compressResponsesInput } from './compress/responses.mjs';
 import { resolveLossyConfig } from './lossy/config.mjs';
@@ -10,36 +12,333 @@ import { DriftDetector } from './analyze/drift-detector.mjs';
 import { injectOpenAICacheKey, resolveOpenAICacheKey } from './normalize/openai-cache-key.mjs';
 import { detectProvider } from './providers/detect.mjs';
 import { resolveUpstreams, selectUpstream } from './providers/upstreams.mjs';
+import { createTelemetryLedger } from './observability/ledger.mjs';
 
 const driftDetector = new DriftDetector();
+const TELEMETRY_SCHEMA_VERSION = 1;
+const TELEMETRY_CAPABILITIES = Object.freeze({
+  snapshot: true,
+  history: true,
+  csv: true,
+  prometheus: true,
+  flush: true,
+  persistence: true,
+});
+const TELEMETRY_HISTORY_SERIES = Object.freeze([
+  'compression.requests',
+  'compression.tokens_before',
+  'compression.tokens_after',
+  'compression.tokens_saved',
+  'compression.latency_ms',
+  'proxy.requests',
+  'proxy.latency_ms',
+]);
+const DEFAULT_TELEMETRY_PATH = join(homedir(), '.headroom-lite', 'telemetry.json');
+let defaultTelemetryLedger;
+
+function createLegacyStatsState() {
+  return {
+    startedAt: Date.now(),
+    proxyRequests: 0,
+    compressRequests: 0,
+    compressTokensBefore: 0,
+    compressTokensAfter: 0,
+  };
+}
 
 // ── In-memory stats counters (reset on process restart) ──────────────────────
-const _stats = {
-  startedAt: Date.now(),
-  proxyRequests: 0,
-  compressRequests: 0,
-  compressTokensBefore: 0,
-  compressTokensAfter: 0,
-};
+const defaultStatsState = createLegacyStatsState();
 
 /** Read-only snapshot — safe to JSON.serialize directly. */
-export function getStats() {
-  const uptimeSec = Math.floor((Date.now() - _stats.startedAt) / 1000);
-  const saved = _stats.compressTokensBefore - _stats.compressTokensAfter;
-  const pct = _stats.compressTokensBefore > 0
-    ? (saved / _stats.compressTokensBefore * 100).toFixed(1)
+export function getStats(statsState = defaultStatsState) {
+  const uptimeSec = Math.floor((Date.now() - statsState.startedAt) / 1000);
+  const saved = statsState.compressTokensBefore - statsState.compressTokensAfter;
+  const pct = statsState.compressTokensBefore > 0
+    ? (saved / statsState.compressTokensBefore * 100).toFixed(1)
     : '0.0';
   return {
     status: 'ok',
     service: 'headroom-lite',
     uptime_seconds: uptimeSec,
-    proxy_requests: _stats.proxyRequests,
-    compress_requests: _stats.compressRequests,
-    compress_tokens_before: _stats.compressTokensBefore,
-    compress_tokens_after: _stats.compressTokensAfter,
+    proxy_requests: statsState.proxyRequests,
+    compress_requests: statsState.compressRequests,
+    compress_tokens_before: statsState.compressTokensBefore,
+    compress_tokens_after: statsState.compressTokensAfter,
     compress_tokens_saved: saved,
     compress_pct: pct,
   };
+}
+
+function createEmptyAggregate() {
+  return {
+    compression: {
+      requests: 0,
+      tokens_before: 0,
+      tokens_after: 0,
+      tokens_saved: 0,
+      latency_ms: 0,
+      outcomes: {},
+      providers: {},
+      models: {},
+    },
+    proxy: {
+      requests: 0,
+      latency_ms: 0,
+      outcomes: {},
+      providers: {},
+      models: {},
+    },
+  };
+}
+
+function createCompatibilitySnapshot(capturedAt = new Date(), statsState = defaultStatsState) {
+  const legacy = getStats(statsState);
+  const aggregate = createEmptyAggregate();
+  aggregate.compression.requests = legacy.compress_requests;
+  aggregate.compression.tokens_before = legacy.compress_tokens_before;
+  aggregate.compression.tokens_after = legacy.compress_tokens_after;
+  aggregate.compression.tokens_saved = legacy.compress_tokens_saved;
+  aggregate.proxy.requests = legacy.proxy_requests;
+
+  return {
+    schema_version: TELEMETRY_SCHEMA_VERSION,
+    captured_at: capturedAt.toISOString(),
+    status: 'ok',
+    service: 'headroom-lite',
+    capabilities: { ...TELEMETRY_CAPABILITIES },
+    lifetime: aggregate,
+    session: structuredClone(aggregate),
+    history: {
+      retained_points: 0,
+      max_points: 0,
+      max_age_ms: 0,
+      has_predecessor_baseline: false,
+      series: [...TELEMETRY_HISTORY_SERIES],
+    },
+  };
+}
+
+function getTelemetrySnapshot(telemetryLedger, statsState = defaultStatsState) {
+  if (!telemetryLedger || typeof telemetryLedger.snapshot !== 'function') {
+    return createCompatibilitySnapshot(new Date(), statsState);
+  }
+  return telemetryLedger.snapshot();
+}
+
+function writeText(response, statusCode, body, contentType) {
+  response.writeHead(statusCode, {
+    'content-type': contentType,
+    'content-length': Buffer.byteLength(body).toString(),
+  });
+  response.end(body);
+}
+
+function metricValue(value) {
+  return Number.isInteger(value) ? String(value) : String(Number(value) || 0);
+}
+
+function hourBucketStart(isoTimestamp) {
+  const bucket = new Date(isoTimestamp);
+  bucket.setUTCMinutes(0, 0, 0);
+  return bucket.toISOString();
+}
+
+function buildCompatibilityPrometheus(snapshot) {
+  const totalRequests = (snapshot.session?.compression?.requests ?? 0) + (snapshot.session?.proxy?.requests ?? 0);
+  return [
+    '# HELP headroom_lite_requests_total total session requests',
+    '# TYPE headroom_lite_requests_total counter',
+    `headroom_lite_requests_total ${metricValue(totalRequests)}`,
+  ].join('\n');
+}
+
+function normalizeHistorySeries(value) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (!normalized || normalized === 'history' || normalized === 'hourly') return 'hourly';
+  if (normalized === 'daily' || normalized === 'weekly' || normalized === 'monthly') return normalized;
+  throw new HttpError(400, 'series must be one of "history", "hourly", "daily", "weekly", or "monthly"');
+}
+
+function normalizeHistoryFormat(value) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : 'json';
+  if (normalized === 'json' || normalized === 'csv') return normalized;
+  throw new HttpError(400, 'format must be "json" or "csv"');
+}
+
+function startOfWeek(date) {
+  const bucket = new Date(date);
+  bucket.setUTCHours(0, 0, 0, 0);
+  const day = bucket.getUTCDay();
+  const delta = (day + 6) % 7;
+  bucket.setUTCDate(bucket.getUTCDate() - delta);
+  return bucket.toISOString();
+}
+
+function bucketHistoryStart(isoTimestamp, resolution) {
+  if (resolution === 'hourly') return hourBucketStart(isoTimestamp);
+
+  const bucket = new Date(isoTimestamp);
+  if (resolution === 'daily') {
+    bucket.setUTCHours(0, 0, 0, 0);
+    return bucket.toISOString();
+  }
+  if (resolution === 'weekly') {
+    return startOfWeek(bucket);
+  }
+  bucket.setUTCDate(1);
+  bucket.setUTCHours(0, 0, 0, 0);
+  return bucket.toISOString();
+}
+
+function collectHistoryRows(telemetryLedger, resolution, snapshot, telemetryState) {
+  const rows = [];
+  if (telemetryLedger?.history) {
+    for (const series of snapshot.history?.series ?? []) {
+      rows.push(...telemetryLedger.history({ series }));
+    }
+  }
+  rows.push(...getPendingHistoryRows(telemetryState));
+  if (resolution === 'hourly') {
+    return rows.sort((left, right) => left.bucket_start.localeCompare(right.bucket_start) || left.series.localeCompare(right.series));
+  }
+
+  const grouped = new Map();
+  for (const row of rows) {
+    const bucketStart = bucketHistoryStart(row.bucket_start, resolution);
+    const key = `${row.series}\u0000${bucketStart}`;
+    grouped.set(key, (grouped.get(key) ?? 0) + row.value);
+  }
+
+  return [...grouped.entries()]
+    .map(([key, value]) => {
+      const [series, bucket_start] = key.split('\u0000');
+      return { series, bucket_start, value };
+    })
+    .sort((left, right) => left.bucket_start.localeCompare(right.bucket_start) || left.series.localeCompare(right.series));
+}
+
+function historyRowsToCsv(rows) {
+  return ['series,bucket_start,value', ...rows.map((row) => `${row.series},${row.bucket_start},${row.value}`)].join('\n');
+}
+
+function createTelemetryState() {
+  return {
+    pendingRows: new Map(),
+    flushTimer: null,
+  };
+}
+
+function addPendingHistoryRows(telemetryState, capturedAt, deltas) {
+  const bucketStart = hourBucketStart(capturedAt.toISOString());
+  for (const [series, value] of deltas) {
+    if (!(value > 0)) continue;
+    const key = `${series}\u0000${bucketStart}`;
+    telemetryState.pendingRows.set(key, (telemetryState.pendingRows.get(key) ?? 0) + value);
+  }
+}
+
+function getPendingHistoryRows(telemetryState) {
+  return [...telemetryState.pendingRows.entries()]
+    .map(([key, value]) => {
+      const [series, bucket_start] = key.split('\u0000');
+      return { series, bucket_start, value };
+    })
+    .sort((left, right) => left.bucket_start.localeCompare(right.bucket_start) || left.series.localeCompare(right.series));
+}
+
+function nativeHistoryCsv(telemetryLedger, snapshot, telemetryState) {
+  if (!telemetryLedger || typeof telemetryLedger.toCsv !== 'function') {
+    return historyRowsToCsv(getPendingHistoryRows(telemetryState));
+  }
+  const seriesList = snapshot.history?.series ?? [];
+  if (seriesList.length === 0) {
+    return historyRowsToCsv(getPendingHistoryRows(telemetryState));
+  }
+
+  const firstCsv = telemetryLedger.toCsv({ series: seriesList[0] });
+  if (!firstCsv.startsWith('series,bucket_start,value')) {
+    return firstCsv;
+  }
+
+  const rows = firstCsv.trim().split('\n').slice(1).filter(Boolean);
+  for (const series of seriesList.slice(1)) {
+    const csv = telemetryLedger.toCsv({ series });
+    rows.push(...csv.trim().split('\n').slice(1).filter(Boolean));
+  }
+  rows.push(...getPendingHistoryRows(telemetryState).map((row) => `${row.series},${row.bucket_start},${row.value}`));
+  return ['series,bucket_start,value', ...rows].join('\n');
+}
+
+function flushTelemetry(telemetryLedger, telemetryState) {
+  if (!telemetryLedger?.flush) return;
+  try {
+    telemetryLedger.flush?.();
+    telemetryState.pendingRows.clear();
+  } catch {
+    // Observability must never disrupt proxy/compression behavior.
+  }
+}
+
+function scheduleTelemetryFlush(server, telemetryLedger, telemetryState) {
+  if (!telemetryLedger?.flush) return;
+
+  const scheduleNext = () => {
+    const now = new Date();
+    const next = new Date(now);
+    next.setUTCMinutes(0, 0, 0);
+    next.setUTCHours(next.getUTCHours() + 1);
+    const delay = Math.max(1, next.getTime() - now.getTime() - 1);
+    telemetryState.flushTimer = setTimeout(() => {
+      flushTelemetry(telemetryLedger, telemetryState);
+      scheduleNext();
+    }, delay);
+    telemetryState.flushTimer.unref?.();
+  };
+
+  scheduleNext();
+  server.on('close', () => {
+    if (telemetryState.flushTimer) clearTimeout(telemetryState.flushTimer);
+    flushTelemetry(telemetryLedger, telemetryState);
+  });
+}
+
+function persistTelemetry(telemetryLedger, telemetryState, record, deltas) {
+  if (!telemetryLedger) return;
+  try {
+    record();
+    const capturedAt = new Date(telemetryLedger.snapshot?.().captured_at ?? Date.now());
+    addPendingHistoryRows(telemetryState, capturedAt, deltas);
+  } catch {
+    // Observability must never disrupt proxy/compression behavior.
+  }
+}
+
+function observeProxyOutcome(response, telemetryLedger, telemetryState, { provider, startedAt }) {
+  if (!telemetryLedger || typeof telemetryLedger.recordProxy !== 'function') return;
+  response.once('finish', () => {
+    let outcome = 'ok';
+    if ((response.statusCode ?? 0) >= 500) outcome = 'error';
+    if (response.statusCode === 504) outcome = 'timeout';
+    const latencyMs = Date.now() - startedAt;
+    persistTelemetry(telemetryLedger, telemetryState, () => {
+      telemetryLedger.recordProxy({
+        latencyMs,
+        outcome,
+        provider: provider === 'unknown' ? undefined : provider,
+      });
+    }, [
+      ['proxy.requests', 1],
+      ['proxy.latency_ms', latencyMs],
+    ]);
+  });
+}
+
+function resolveTelemetryLedger(telemetryLedger) {
+  if (telemetryLedger) return telemetryLedger;
+  if (!defaultTelemetryLedger) {
+    defaultTelemetryLedger = createTelemetryLedger({ path: DEFAULT_TELEMETRY_PATH });
+  }
+  return defaultTelemetryLedger;
 }
 
 export const DEFAULT_HOST = '127.0.0.1';
@@ -89,7 +388,8 @@ export function resolveMaxBodyBytes(input = process.env.HEADROOM_LITE_MAX_BODY_B
   return parseIntOption(input, DEFAULT_MAX_BODY_BYTES);
 }
 
-async function handleCompress(request, response, { maxBodyBytes, compressLive, lossyConfig }) {
+async function handleCompress(request, response, { maxBodyBytes, compressLive, lossyConfig, telemetryLedger, telemetryState, statsState }) {
+  const startedAt = Date.now();
   const rawBody = await readRequestBody(request, maxBodyBytes);
 
   let payload;
@@ -150,9 +450,9 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
   });
   const { messages, tokensBefore, tokensAfter, frozenCount } = result;
 
-  _stats.compressRequests++;
-  _stats.compressTokensBefore += tokensBefore;
-  _stats.compressTokensAfter += tokensAfter;
+  statsState.compressRequests++;
+  statsState.compressTokensBefore += tokensBefore;
+  statsState.compressTokensAfter += tokensAfter;
 
   const normalizedTools = Array.isArray(payload.tools)
     ? normalizeTools(payload.tools)
@@ -191,11 +491,30 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
   }
 
   writeJson(response, 200, responseBody);
+  const latencyMs = Date.now() - startedAt;
+  const tokensSaved = Math.max(0, tokensBefore - tokensAfter);
+  persistTelemetry(telemetryLedger, telemetryState, () => {
+    telemetryLedger.recordCompression?.({
+      tokensBefore,
+      tokensAfter,
+      latencyMs,
+      outcome: 'ok',
+      provider: payload.format === 'openai' ? 'openai' : 'anthropic',
+      model: typeof payload.model === 'string' ? payload.model : undefined,
+    });
+  }, [
+    ['compression.requests', 1],
+    ['compression.tokens_before', tokensBefore],
+    ['compression.tokens_after', tokensAfter],
+    ['compression.tokens_saved', tokensSaved],
+    ['compression.latency_ms', latencyMs],
+  ]);
 }
 
 async function routeRequest(request, response, options) {
   const method = request.method ?? 'GET';
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? '127.0.0.1'}`);
+  const telemetrySnapshot = getTelemetrySnapshot(options.telemetryLedger, options.statsState);
 
   if (method === 'GET' && url.pathname === '/health') {
     // Check whether any upstream is configured
@@ -204,17 +523,29 @@ async function routeRequest(request, response, options) {
     writeJson(response, 200, {
       status: 'ok',
       service: 'headroom-lite',
+      schema_version: telemetrySnapshot.schema_version,
       mode: anyUpstream ? 'proxy+deterministic' : 'deterministic',
       max_body_bytes: options.maxBodyBytes,
       compress_live: options.compressLive,
       // legacy field kept for one release for backward compat with existing scrapers
       upstream: upstreams.legacy,
       upstreams,
+      capabilities: telemetrySnapshot.capabilities,
       lossy: {
         enabled: lossyConfig.enabled,
         backend: lossyConfig.backend,
         service_url: lossyConfig.serviceUrl,
       },
+    });
+    return;
+  }
+
+  if (method === 'GET' && url.pathname === '/readyz') {
+    writeJson(response, 200, {
+      status: 'ready',
+      service: 'headroom-lite',
+      schema_version: telemetrySnapshot.schema_version,
+      capabilities: telemetrySnapshot.capabilities,
     });
     return;
   }
@@ -228,7 +559,46 @@ async function routeRequest(request, response, options) {
   }
 
   if (method === 'GET' && url.pathname === '/stats') {
-    writeJson(response, 200, getStats());
+    writeJson(response, 200, {
+      ...getStats(options.statsState),
+      ...telemetrySnapshot,
+    });
+    return;
+  }
+
+  if (method === 'GET' && url.pathname === '/stats-history') {
+    const format = normalizeHistoryFormat(url.searchParams.get('format') ?? 'json');
+    const series = normalizeHistorySeries(url.searchParams.get('series') ?? 'history');
+    if (format === 'csv') {
+      const body = series === 'hourly'
+        ? nativeHistoryCsv(options.telemetryLedger, telemetrySnapshot, options.telemetryState)
+        : historyRowsToCsv(collectHistoryRows(options.telemetryLedger, series, telemetrySnapshot, options.telemetryState));
+      writeText(response, 200, body, 'text/csv; charset=utf-8');
+      return;
+    }
+    const rows = collectHistoryRows(options.telemetryLedger, series, telemetrySnapshot, options.telemetryState);
+    writeJson(response, 200, {
+      schema_version: telemetrySnapshot.schema_version,
+      status: 'ok',
+      service: 'headroom-lite',
+      series,
+      rows,
+    });
+    return;
+  }
+
+  if (method === 'GET' && url.pathname === '/metrics') {
+    const metrics = [buildCompatibilityPrometheus(telemetrySnapshot)];
+    if (options.telemetryLedger?.toPrometheus) {
+      metrics.push(options.telemetryLedger.toPrometheus());
+    } else {
+      metrics.push(
+        '# HELP headroom_lite_schema_version schema version',
+        '# TYPE headroom_lite_schema_version gauge',
+        `headroom_lite_schema_version ${telemetrySnapshot.schema_version}`,
+      );
+    }
+    writeText(response, 200, metrics.join('\n'), 'text/plain; version=0.0.4; charset=utf-8');
     return;
   }
 
@@ -242,7 +612,8 @@ async function routeRequest(request, response, options) {
   const chosenUpstream = selectUpstream(options.upstreams, provider);
 
   if (chosenUpstream) {
-    _stats.proxyRequests++;
+    options.statsState.proxyRequests++;
+    observeProxyOutcome(response, options.telemetryLedger, options.telemetryState, { provider, startedAt: Date.now() });
     if (options.compressProxy) {
       proxyCompressedRequest(request, response, {
         upstream: chosenUpstream,
@@ -278,6 +649,7 @@ export function createServer({
   compressProxy = resolveCompressProxy(),
   compressLive = resolveCompressLive(),
   lossyConfig = resolveLossyConfig(),
+  telemetryLedger = undefined,
 } = {}) {
   const resolvedUpstreams = upstreams ?? {
     legacy: upstream,
@@ -285,9 +657,28 @@ export function createServer({
     openai: null,
     'github-models': null,
   };
+  const resolvedTelemetryLedger = resolveTelemetryLedger(telemetryLedger);
+  const telemetryState = createTelemetryState();
+  const statsState = telemetryLedger === undefined ? defaultStatsState : createLegacyStatsState();
 
   const server = http.createServer((request, response) => {
-    routeRequest(request, response, { maxBodyBytes, upstreams: resolvedUpstreams, proxyTimeoutMs, compressProxy, compressLive, lossyConfig }).catch((error) => {
+    routeRequest(request, response, {
+      maxBodyBytes,
+      upstreams: resolvedUpstreams,
+      proxyTimeoutMs,
+      compressProxy,
+      compressLive,
+      lossyConfig,
+      telemetryLedger: resolvedTelemetryLedger,
+      telemetryState,
+      statsState,
+    }).catch((error) => {
+      if (response.headersSent || response.writableEnded || response.destroyed) {
+        if (!response.destroyed && !response.writableEnded) {
+          response.destroy();
+        }
+        return;
+      }
       if (error instanceof HttpError) {
         writeJson(response, error.statusCode, { error: error.message });
         return;
@@ -301,6 +692,7 @@ export function createServer({
     if (error.code === 'ECONNRESET' || !socket.writable) return;
     socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
   });
+  scheduleTelemetryFlush(server, resolvedTelemetryLedger, telemetryState);
 
   return server;
 }
@@ -315,6 +707,7 @@ export function startServer({
   compressProxy = resolveCompressProxy(),
   compressLive = resolveCompressLive(),
   lossyConfig = resolveLossyConfig(),
+  telemetryLedger = undefined,
 } = {}) {
   let resolvedUpstreams;
   if (upstreams !== undefined) {
@@ -325,7 +718,15 @@ export function startServer({
     resolvedUpstreams = resolveUpstreams();
   }
 
-  const server = createServer({ maxBodyBytes, upstreams: resolvedUpstreams, proxyTimeoutMs, compressProxy, compressLive, lossyConfig });
+  const server = createServer({
+    maxBodyBytes,
+    upstreams: resolvedUpstreams,
+    proxyTimeoutMs,
+    compressProxy,
+    compressLive,
+    lossyConfig,
+    telemetryLedger,
+  });
 
   return new Promise((resolve, reject) => {
     server.once('error', reject);

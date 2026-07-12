@@ -1,7 +1,15 @@
+import http from 'node:http';
 import { after, before, describe, it } from 'node:test';
 import { strict as assert } from 'node:assert';
+import { mkdirSync, rmSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { compressMessages } from '../src/compress/pipeline.mjs';
+import { createTelemetryLedger } from '../src/observability/ledger.mjs';
 import { createServer, startServer } from '../src/server.mjs';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ARTIFACT_ROOT = join(__dirname, '.artifacts', 'server');
 
 const DUPLICATE_FILE_SPAN = [
   'export async function login(user, password) {',
@@ -29,24 +37,109 @@ const REPEATED_LOG = [
   '',
 ].join('\n');
 
+after(() => {
+  rmSync(join(__dirname, '.artifacts'), { recursive: true, force: true });
+});
+
+function ledgerPath(name = 'stats.json') {
+  mkdirSync(ARTIFACT_ROOT, { recursive: true });
+  return join(ARTIFACT_ROOT, name);
+}
+
+async function closeServer(server) {
+  await new Promise((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
+}
+
+async function listenServer(server) {
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', reject);
+      resolve(server);
+    });
+  });
+}
+
+function createStubTelemetryLedger(overrides = {}) {
+  const snapshot = {
+    schema_version: 1,
+    captured_at: '2026-01-01T00:00:00.000Z',
+    status: 'ok',
+    service: 'headroom-lite',
+    capabilities: {
+      snapshot: true,
+      history: true,
+      csv: true,
+      prometheus: true,
+      flush: true,
+      persistence: true,
+    },
+    lifetime: {
+      compression: { requests: 0, tokens_before: 0, tokens_after: 0, tokens_saved: 0, latency_ms: 0, outcomes: {}, providers: {}, models: {} },
+      proxy: { requests: 0, latency_ms: 0, outcomes: {}, providers: {}, models: {} },
+    },
+    session: {
+      compression: { requests: 0, tokens_before: 0, tokens_after: 0, tokens_saved: 0, latency_ms: 0, outcomes: {}, providers: {}, models: {} },
+      proxy: { requests: 0, latency_ms: 0, outcomes: {}, providers: {}, models: {} },
+    },
+    history: {
+      retained_points: 0,
+      max_points: 720,
+      max_age_ms: 30 * 24 * 60 * 60 * 1000,
+      has_predecessor_baseline: false,
+      series: [
+        'compression.requests',
+        'compression.tokens_before',
+        'compression.tokens_after',
+        'compression.tokens_saved',
+        'compression.latency_ms',
+        'proxy.requests',
+        'proxy.latency_ms',
+      ],
+    },
+  };
+
+  return {
+    snapshot() {
+      return structuredClone(snapshot);
+    },
+    history() {
+      return [];
+    },
+    toCsv() {
+      return 'series,bucket_start,value';
+    },
+    toPrometheus() {
+      return '# HELP headroom_lite_schema_version schema version\n# TYPE headroom_lite_schema_version gauge\nheadroom_lite_schema_version 1';
+    },
+    recordCompression() {},
+    recordProxy() {},
+    flush() {},
+    ...overrides,
+  };
+}
+
 describe('HTTP server', () => {
   let server;
   let baseUrl;
+  let telemetryLedger;
 
   before(async () => {
+    telemetryLedger = createTelemetryLedger({ path: ledgerPath('http-server-stats.json') });
     server = await startServer({
       host: '127.0.0.1',
       port: 0,
       maxBodyBytes: 1024 * 1024,
+      telemetryLedger,
     });
     const address = server.address();
     baseUrl = `http://127.0.0.1:${address.port}`;
   });
 
   after(async () => {
-    await new Promise((resolve, reject) => {
-      server.close((error) => (error ? reject(error) : resolve()));
-    });
+    await closeServer(server);
   });
 
   it('serves health and liveness endpoints', async () => {
@@ -61,11 +154,13 @@ describe('HTTP server', () => {
     assert.deepEqual(await health.json(), {
       status: 'ok',
       service: 'headroom-lite',
+      schema_version: 1,
       mode: 'deterministic',
       max_body_bytes: 1024 * 1024,
       compress_live: false,
       upstream: null,
       upstreams: { legacy: null, anthropic: null, openai: null, 'github-models': null },
+      capabilities: telemetryLedger.snapshot().capabilities,
       lossy: { enabled: false, backend: 'llmlingua2', service_url: 'http://127.0.0.1:8791' },
     });
     assert.deepEqual(await livez.json(), {
@@ -74,12 +169,49 @@ describe('HTTP server', () => {
     });
   });
 
-  it('serves /stats endpoint with counters', async () => {
+  it('serves readiness, versioned stats history, and Prometheus metrics', async () => {
+    const [ready, history, metrics] = await Promise.all([
+      fetch(`${baseUrl}/readyz`),
+      fetch(`${baseUrl}/stats-history?series=hourly`),
+      fetch(`${baseUrl}/metrics`),
+    ]);
+
+    assert.equal(ready.status, 200);
+    assert.deepEqual(await ready.json(), {
+      status: 'ready',
+      service: 'headroom-lite',
+      schema_version: 1,
+      capabilities: telemetryLedger.snapshot().capabilities,
+    });
+
+    assert.equal(history.status, 200);
+    assert.equal(history.headers.get('content-type'), 'application/json; charset=utf-8');
+    assert.deepEqual(await history.json(), {
+      schema_version: 1,
+      status: 'ok',
+      service: 'headroom-lite',
+      series: 'hourly',
+      rows: [],
+    });
+
+    assert.equal(metrics.status, 200);
+    assert.equal(metrics.headers.get('content-type'), 'text/plain; version=0.0.4; charset=utf-8');
+    const metricsText = await metrics.text();
+    assert.match(metricsText, /^# HELP headroom_lite_requests_total total session requests$/m);
+    assert.match(metricsText, /^# TYPE headroom_lite_requests_total counter$/m);
+    assert.match(metricsText, /^headroom_lite_schema_version 1$/m);
+  });
+
+  it('serves /stats endpoint with legacy counters plus versioned telemetry', async () => {
     const r = await fetch(`${baseUrl}/stats`);
     assert.equal(r.status, 200);
     const body = await r.json();
+    assert.equal(body.schema_version, 1);
     assert.equal(body.status, 'ok');
     assert.equal(body.service, 'headroom-lite');
+    assert.ok(typeof body.captured_at === 'string');
+    assert.deepEqual(body.capabilities, telemetryLedger.snapshot().capabilities);
+    assert.ok(body.lifetime && body.session && body.history);
     assert.ok(typeof body.uptime_seconds === 'number' && body.uptime_seconds >= 0);
     assert.ok(typeof body.proxy_requests === 'number');
     assert.ok(typeof body.compress_requests === 'number');
@@ -89,15 +221,50 @@ describe('HTTP server', () => {
     assert.ok(typeof body.compress_pct === 'string');
   });
 
-  it('/stats compress_requests increments after /v1/compress call', async () => {
+  it('records /v1/compress telemetry only after successful responses', async () => {
     const before = await (await fetch(`${baseUrl}/stats`)).json();
+    const invalid = await fetch(`${baseUrl}/v1/compress`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ format: 'openai' }),
+    });
+    assert.equal(invalid.status, 400);
+    const afterInvalid = await (await fetch(`${baseUrl}/stats`)).json();
+    assert.equal(afterInvalid.compress_requests, before.compress_requests);
+    assert.equal(afterInvalid.session.compression.requests, before.session.compression.requests);
+
     await fetch(`${baseUrl}/v1/compress`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
     });
-    const after = await (await fetch(`${baseUrl}/stats`)).json();
-    assert.equal(after.compress_requests, before.compress_requests + 1);
+    const afterSuccess = await (await fetch(`${baseUrl}/stats`)).json();
+    assert.equal(afterSuccess.compress_requests, before.compress_requests + 1);
+    assert.equal(afterSuccess.session.compression.requests, before.session.compression.requests + 1);
+    const history = await (await fetch(`${baseUrl}/stats-history?series=hourly`)).json();
+    assert.ok(history.rows.some((row) => row.series === 'compression.requests' && row.value >= 1));
+  });
+
+  it('serves csv stats history and rejects unsupported history queries', async () => {
+    const [csv, badFormat, badSeries] = await Promise.all([
+      fetch(`${baseUrl}/stats-history?series=hourly&format=csv`),
+      fetch(`${baseUrl}/stats-history?series=hourly&format=xml`),
+      fetch(`${baseUrl}/stats-history?series=yearly`),
+    ]);
+
+    assert.equal(csv.status, 200);
+    assert.equal(csv.headers.get('content-type'), 'text/csv; charset=utf-8');
+    assert.match(await csv.text(), /^series,bucket_start,value/m);
+
+    assert.equal(badFormat.status, 400);
+    assert.deepEqual(await badFormat.json(), {
+      error: 'format must be "json" or "csv"',
+    });
+
+    assert.equal(badSeries.status, 400);
+    assert.deepEqual(await badSeries.json(), {
+      error: 'series must be one of "history", "hourly", "daily", "weekly", or "monthly"',
+    });
   });
 
   it('compresses a conversation via the /v1/compress contract', async () => {
@@ -261,5 +428,154 @@ describe('HTTP server', () => {
     });
 
     assert.equal(payload, 'HTTP/1.1 400 Bad Request\r\n\r\n');
+  });
+
+  it('records successful proxy outcomes in the telemetry ledger', async () => {
+    const upstreamServer = await listenServer(http.createServer((_request, response) => {
+      response.writeHead(204);
+      response.end();
+    }));
+    const upstreamAddress = upstreamServer.address();
+    const ledger = createTelemetryLedger({ path: ledgerPath('proxy-success.json') });
+    const proxyServer = await listenServer(createServer({
+      upstream: `http://127.0.0.1:${upstreamAddress.port}`,
+      telemetryLedger: ledger,
+    }));
+    const proxyAddress = proxyServer.address();
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${proxyAddress.port}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-sonnet-4.5', messages: [] }),
+      });
+
+      assert.equal(response.status, 204);
+      const snapshot = ledger.snapshot();
+      assert.equal(snapshot.session.proxy.requests, 1);
+      assert.equal(snapshot.session.proxy.outcomes.ok, 1);
+      assert.equal(snapshot.session.proxy.providers.anthropic, 1);
+    } finally {
+      await closeServer(proxyServer);
+      await closeServer(upstreamServer);
+    }
+  });
+
+  it('records 502 proxy fallbacks in the telemetry ledger', async () => {
+    const ledger = createTelemetryLedger({ path: ledgerPath('proxy-error.json') });
+    const proxyServer = await listenServer(createServer({
+      upstream: 'http://127.0.0.1:1',
+      telemetryLedger: ledger,
+    }));
+    const proxyAddress = proxyServer.address();
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${proxyAddress.port}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-sonnet-4.5', messages: [] }),
+      });
+
+      assert.equal(response.status, 502);
+      const snapshot = ledger.snapshot();
+      assert.equal(snapshot.session.proxy.requests, 1);
+      assert.equal(snapshot.session.proxy.outcomes.error, 1);
+      assert.equal(snapshot.session.proxy.providers.anthropic, 1);
+    } finally {
+      await closeServer(proxyServer);
+    }
+  });
+
+  it('records upstream 5xx proxy responses as errors', async () => {
+    const upstreamServer = await listenServer(http.createServer((_request, response) => {
+      response.writeHead(503, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ error: 'upstream unavailable' }));
+    }));
+    const upstreamAddress = upstreamServer.address();
+    const ledger = createTelemetryLedger({ path: ledgerPath('proxy-upstream-error.json') });
+    const proxyServer = await listenServer(createServer({
+      upstream: `http://127.0.0.1:${upstreamAddress.port}`,
+      telemetryLedger: ledger,
+    }));
+    const proxyAddress = proxyServer.address();
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${proxyAddress.port}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-sonnet-4.5', messages: [] }),
+      });
+
+      assert.equal(response.status, 503);
+      const snapshot = ledger.snapshot();
+      assert.equal(snapshot.session.proxy.requests, 1);
+      assert.equal(snapshot.session.proxy.outcomes.error, 1);
+    } finally {
+      await closeServer(proxyServer);
+      await closeServer(upstreamServer);
+    }
+  });
+
+  it('treats telemetry flush failures as best-effort after successful compression', async () => {
+    const fragileLedger = createStubTelemetryLedger({
+      flush() {
+        throw new Error('flush failed');
+      },
+    });
+    const fragileServer = await startServer({
+      host: '127.0.0.1',
+      port: 0,
+      maxBodyBytes: 1024 * 1024,
+      telemetryLedger: fragileLedger,
+    });
+    const address = fragileServer.address();
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${address.port}/v1/compress`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+      });
+
+      assert.equal(response.status, 200);
+      assert.equal((await response.json()).tokens_before, 1);
+    } finally {
+      await closeServer(fragileServer);
+    }
+  });
+
+  it('keeps legacy flat stats scoped to the current server instance', async () => {
+    const firstLedger = createTelemetryLedger({ path: ledgerPath('server-a.json') });
+    const secondLedger = createTelemetryLedger({ path: ledgerPath('server-b.json') });
+    const firstServer = await startServer({
+      host: '127.0.0.1',
+      port: 0,
+      maxBodyBytes: 1024 * 1024,
+      telemetryLedger: firstLedger,
+    });
+    const secondServer = await startServer({
+      host: '127.0.0.1',
+      port: 0,
+      maxBodyBytes: 1024 * 1024,
+      telemetryLedger: secondLedger,
+    });
+    const firstAddress = firstServer.address();
+    const secondAddress = secondServer.address();
+
+    try {
+      const compress = await fetch(`http://127.0.0.1:${firstAddress.port}/v1/compress`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+      });
+      assert.equal(compress.status, 200);
+
+      const stats = await (await fetch(`http://127.0.0.1:${secondAddress.port}/stats`)).json();
+      assert.equal(stats.compress_requests, 0);
+      assert.equal(stats.session.compression.requests, 0);
+    } finally {
+      await closeServer(firstServer);
+      await closeServer(secondServer);
+    }
   });
 });
