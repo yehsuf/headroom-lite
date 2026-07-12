@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert';
-import { mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { after, beforeEach, describe, it } from 'node:test';
@@ -31,6 +31,12 @@ function createClock(initialValue = '2026-01-01T00:00:00.000Z') {
 
 function ledgerPath(name = 'stats.json') {
   return join(ARTIFACT_ROOT, name);
+}
+
+function writePersistedLedger(name, payload) {
+  const path = ledgerPath(name);
+  writeFileSync(path, JSON.stringify(payload, null, 2), 'utf8');
+  return path;
 }
 
 describe('telemetry ledger', () => {
@@ -184,6 +190,79 @@ describe('telemetry ledger', () => {
     assert.doesNotMatch(metrics, /user-body/);
   });
 
+  it('migrates legacy persisted labels on load and rewrites sanitized state immediately', () => {
+    const path = writePersistedLedger('legacy-vulnerable.json', {
+      schema_version: 1,
+      captured_at: '2026-01-01T00:10:00.000Z',
+      status: 'ok',
+      service: 'headroom-lite',
+      capabilities: {
+        snapshot: true,
+        history: true,
+        csv: true,
+        prometheus: true,
+        flush: true,
+        persistence: true,
+      },
+      lifetime: {
+        compression: {
+          requests: 2,
+          tokens_before: 200,
+          tokens_after: 120,
+          tokens_saved: 80,
+          latency_ms: 35,
+          outcomes: { ok: 1, '{"response":"secret"}': 1 },
+          providers: { anthropic: 1, '/Users/alice/.ssh/id_ed25519': 1 },
+          models: { 'claude-sonnet-4.5': 1, 'opaque-auth-token': 1 },
+        },
+        proxy: {
+          requests: 1,
+          latency_ms: 25,
+          outcomes: { timeout: 1 },
+          providers: { 'github-models': 1 },
+          models: { 'gpt-5.5': 1 },
+        },
+      },
+      session: {
+        compression: {
+          requests: 1,
+          tokens_before: 100,
+          tokens_after: 70,
+          tokens_saved: 30,
+          latency_ms: 15,
+          outcomes: { '{"request":"secret"}': 1 },
+          providers: { '/private/tmp/request-body': 1 },
+          models: { 'opaque-auth-token': 1 },
+        },
+        proxy: {
+          requests: 0,
+          latency_ms: 0,
+          outcomes: {},
+          providers: {},
+          models: {},
+        },
+      },
+      history_points: [],
+    });
+
+    const ledger = createTelemetryLedger({ path, now: () => new Date('2026-01-01T00:15:00.000Z') });
+    const snapshot = ledger.snapshot();
+
+    assert.equal(snapshot.lifetime.compression.outcomes.ok, 1);
+    assert.equal(snapshot.lifetime.compression.outcomes.other, 1);
+    assert.equal(snapshot.lifetime.compression.providers.anthropic, 1);
+    assert.equal(snapshot.lifetime.compression.providers.other, 1);
+    assert.equal(snapshot.lifetime.compression.models.claude, 1);
+    assert.equal(snapshot.lifetime.compression.models.other, 1);
+    assert.equal(snapshot.session.compression.requests, 0);
+
+    const persisted = readFileSync(path, 'utf8');
+    assert.equal(persisted.includes('/Users/alice/.ssh/id_ed25519'), false);
+    assert.equal(persisted.includes('/private/tmp/request-body'), false);
+    assert.equal(persisted.includes('opaque-auth-token'), false);
+    assert.equal(persisted.includes('"history_baseline": null'), true);
+  });
+
   it('calculates hourly deltas from cumulative history points', () => {
     const clock = createClock('2026-01-01T00:00:00.000Z');
     const ledger = createTelemetryLedger({ path: ledgerPath(), now: clock.now });
@@ -271,5 +350,79 @@ describe('telemetry ledger', () => {
       { series: 'compression.tokens_saved', bucket_start: '2026-01-01T01:00:00.000Z', value: 20 },
       { series: 'compression.tokens_saved', bucket_start: '2026-01-01T02:00:00.000Z', value: 30 },
     ]);
+  });
+
+  it('discards unreconstructable legacy retained history on reload so the first bucket is not overstated', () => {
+    const path = writePersistedLedger('legacy-history.json', {
+      schema_version: 1,
+      captured_at: '2026-01-01T02:00:00.000Z',
+      status: 'ok',
+      service: 'headroom-lite',
+      capabilities: {
+        snapshot: true,
+        history: true,
+        csv: true,
+        prometheus: true,
+        flush: true,
+        persistence: true,
+      },
+      lifetime: {
+        compression: {
+          requests: 3,
+          tokens_before: 300,
+          tokens_after: 240,
+          tokens_saved: 60,
+          latency_ms: 15,
+          outcomes: {},
+          providers: {},
+          models: {},
+        },
+        proxy: {
+          requests: 0,
+          latency_ms: 0,
+          outcomes: {},
+          providers: {},
+          models: {},
+        },
+      },
+      history_points: [
+        {
+          captured_at: '2026-01-01T01:00:00.000Z',
+          compression: {
+            requests: 2,
+            tokens_before: 200,
+            tokens_after: 170,
+            tokens_saved: 30,
+            latency_ms: 10,
+          },
+          proxy: { requests: 0, latency_ms: 0 },
+        },
+        {
+          captured_at: '2026-01-01T02:00:00.000Z',
+          compression: {
+            requests: 3,
+            tokens_before: 300,
+            tokens_after: 240,
+            tokens_saved: 60,
+            latency_ms: 15,
+          },
+          proxy: { requests: 0, latency_ms: 0 },
+        },
+      ],
+    });
+
+    const reloaded = createTelemetryLedger({
+      path,
+      now: () => new Date('2026-01-01T02:05:00.000Z'),
+      maxHistoryPoints: 2,
+      maxHistoryAgeMs: 2 * 60 * 60 * 1000,
+    });
+
+    assert.deepEqual(reloaded.history({ series: 'compression.tokens_saved' }), []);
+    assert.equal(reloaded.snapshot().history.retained_points, 0);
+
+    const persisted = JSON.parse(readFileSync(path, 'utf8'));
+    assert.deepEqual(persisted.history_points, []);
+    assert.equal(persisted.history_baseline, null);
   });
 });

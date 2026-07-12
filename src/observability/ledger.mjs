@@ -281,19 +281,80 @@ function appendLabeledMetrics(lines, prefix, dimensions) {
   }
 }
 
+function jsonEquals(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function createPersistedState({
+  capturedAt,
+  lifetime,
+  session = createAggregate(),
+  historyBaseline = null,
+  historyPoints = [],
+}) {
+  return {
+    schema_version: SCHEMA_VERSION,
+    captured_at: capturedAt.toISOString(),
+    status: 'ok',
+    service: SERVICE,
+    capabilities: { ...CAPABILITIES },
+    lifetime: cloneAggregate(lifetime),
+    session: cloneAggregate(session),
+    history_baseline: historyBaseline ? normalizeHistoryPoint(historyBaseline) : null,
+    history_points: historyPoints.map(normalizeHistoryPoint).filter(Boolean),
+  };
+}
+
+function writePersistedState(path, persistedState) {
+  mkdirSync(dirname(path), { recursive: true });
+  const tempPath = `${path}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(tempPath, JSON.stringify(persistedState, null, 2), 'utf8');
+  renameSync(tempPath, path);
+}
+
 function loadAggregateState(path) {
-  const emptyState = { lifetime: createAggregate(), historyBaseline: null, historyPoints: [] };
+  const emptyState = {
+    lifetime: createAggregate(),
+    session: createAggregate(),
+    historyBaseline: null,
+    historyPoints: [],
+    needsRewrite: false,
+  };
   if (!existsSync(path)) return emptyState;
 
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8'));
     if (!parsed || parsed.schema_version !== SCHEMA_VERSION) return emptyState;
+    const lifetime = cloneAggregate(parsed.lifetime);
+    const session = cloneAggregate(parsed.session);
+    const hasHistoryBaseline = Object.prototype.hasOwnProperty.call(parsed, 'history_baseline');
+    const normalizedBaseline = hasHistoryBaseline ? normalizeHistoryPoint(parsed.history_baseline) : null;
+    const normalizedHistoryPoints = Array.isArray(parsed.history_points)
+      ? parsed.history_points.map(normalizeHistoryPoint).filter(Boolean)
+      : [];
+    const legacyRetainedHistoryWithoutBaseline = normalizedHistoryPoints.length > 0 && !hasHistoryBaseline;
+
+    let historyBaseline = normalizedBaseline;
+    let historyPoints = normalizedHistoryPoints;
+    if (legacyRetainedHistoryWithoutBaseline || (hasHistoryBaseline && parsed.history_baseline !== null && !normalizedBaseline)) {
+      historyBaseline = null;
+      historyPoints = [];
+    }
+
+    const normalizedPersistedState = createPersistedState({
+      capturedAt: new Date(parsed.captured_at ?? 0),
+      lifetime,
+      session,
+      historyBaseline,
+      historyPoints,
+    });
+
     return {
-      lifetime: cloneAggregate(parsed.lifetime),
-      historyBaseline: normalizeHistoryPoint(parsed.history_baseline),
-      historyPoints: Array.isArray(parsed.history_points)
-        ? parsed.history_points.map(normalizeHistoryPoint).filter(Boolean)
-        : [],
+      lifetime,
+      session,
+      historyBaseline,
+      historyPoints,
+      needsRewrite: !jsonEquals(parsed, normalizedPersistedState),
     };
   } catch {
     return emptyState;
@@ -326,6 +387,20 @@ export function createTelemetryLedger({
     historyBaseline: prunedHistory.baselinePoint,
     historyPoints: prunedHistory.points,
   };
+
+  if (
+    loaded.needsRewrite
+    || !jsonEquals(loaded.historyBaseline, state.historyBaseline)
+    || !jsonEquals(loaded.historyPoints, state.historyPoints)
+  ) {
+    writePersistedState(path, createPersistedState({
+      capturedAt: new Date(now()),
+      lifetime: state.lifetime,
+      session: state.session,
+      historyBaseline: state.historyBaseline,
+      historyPoints: state.historyPoints,
+    }));
+  }
 
   function snapshotAt(capturedAt) {
     return {
@@ -456,22 +531,13 @@ export function createTelemetryLedger({
     state.historyBaseline = prunedHistory.baselinePoint;
     state.historyPoints = prunedHistory.points;
 
-    const payload = JSON.stringify({
-      schema_version: SCHEMA_VERSION,
-      captured_at: capturedAt.toISOString(),
-      status: 'ok',
-      service: SERVICE,
-      capabilities: { ...CAPABILITIES },
-      lifetime: cloneAggregate(state.lifetime),
-      session: cloneAggregate(state.session),
-      history_baseline: state.historyBaseline,
-      history_points: state.historyPoints,
-    }, null, 2);
-
-    mkdirSync(dirname(path), { recursive: true });
-    const tempPath = `${path}.tmp-${process.pid}-${capturedAt.getTime()}`;
-    writeFileSync(tempPath, payload, 'utf8');
-    renameSync(tempPath, path);
+    writePersistedState(path, createPersistedState({
+      capturedAt,
+      lifetime: state.lifetime,
+      session: state.session,
+      historyBaseline: state.historyBaseline,
+      historyPoints: state.historyPoints,
+    }));
     return snapshotAt(capturedAt);
   }
 
