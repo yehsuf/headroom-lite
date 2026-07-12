@@ -158,8 +158,9 @@ function buildCompatibilityPrometheus(snapshot) {
 }
 
 function normalizeHistorySeries(value) {
+  if (value == null) return 'hourly';
   const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
-  if (!normalized || normalized === 'history' || normalized === 'hourly') return 'hourly';
+  if (normalized === 'history' || normalized === 'hourly') return 'hourly';
   if (normalized === 'daily' || normalized === 'weekly' || normalized === 'monthly') return normalized;
   throw new HttpError(400, 'series must be one of "history", "hourly", "daily", "weekly", or "monthly"');
 }
@@ -554,7 +555,11 @@ async function routeRequest(request, response, options) {
   if (method === 'GET' && url.pathname === '/stats-history') {
     validateStatsHistoryQuery(url.searchParams);
     const format = normalizeHistoryFormat(url.searchParams.get('format') ?? 'json');
-    const series = normalizeHistorySeries(url.searchParams.get('series') ?? 'history');
+    const series = normalizeHistorySeries(
+      url.searchParams.has('series')
+        ? url.searchParams.get('series')
+        : undefined,
+    );
     const rows = collectHistoryRows(options.telemetryLedger, series, telemetrySnapshot, options.telemetryState);
     if (format === 'csv') {
       const body = historyRowsToCsv(rows);

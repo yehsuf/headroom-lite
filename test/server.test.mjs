@@ -38,7 +38,7 @@ const REPEATED_LOG = [
 ].join('\n');
 
 after(() => {
-  rmSync(join(__dirname, '.artifacts'), { recursive: true, force: true });
+  rmSync(ARTIFACT_ROOT, { recursive: true, force: true });
 });
 
 function ledgerPath(name = 'stats.json') {
@@ -199,7 +199,7 @@ describe('HTTP server', () => {
   it('serves readiness, versioned stats history, and Prometheus metrics', async () => {
     const [ready, history, metrics] = await Promise.all([
       fetch(`${baseUrl}/readyz`),
-      fetch(`${baseUrl}/stats-history?series=hourly`),
+      fetch(`${baseUrl}/stats-history`),
       fetch(`${baseUrl}/metrics`),
     ]);
 
@@ -332,10 +332,12 @@ describe('HTTP server', () => {
   });
 
   it('serves csv stats history and rejects unsupported history queries', async () => {
-    const [csv, badFormat, badSeries, unexpectedKey] = await Promise.all([
+    const [csv, badFormat, badSeries, emptySeries, whitespaceSeries, unexpectedKey] = await Promise.all([
       fetch(`${baseUrl}/stats-history?series=hourly&format=csv`),
       fetch(`${baseUrl}/stats-history?series=hourly&format=xml`),
       fetch(`${baseUrl}/stats-history?series=yearly`),
+      fetch(`${baseUrl}/stats-history?series=`),
+      fetch(`${baseUrl}/stats-history?series=%20%20`),
       fetch(`${baseUrl}/stats-history?series=hourly&unexpected=1`),
     ]);
 
@@ -350,6 +352,16 @@ describe('HTTP server', () => {
 
     assert.equal(badSeries.status, 400);
     assert.deepEqual(await badSeries.json(), {
+      error: 'series must be one of "history", "hourly", "daily", "weekly", or "monthly"',
+    });
+
+    assert.equal(emptySeries.status, 400);
+    assert.deepEqual(await emptySeries.json(), {
+      error: 'series must be one of "history", "hourly", "daily", "weekly", or "monthly"',
+    });
+
+    assert.equal(whitespaceSeries.status, 400);
+    assert.deepEqual(await whitespaceSeries.json(), {
       error: 'series must be one of "history", "hourly", "daily", "weekly", or "monthly"',
     });
 

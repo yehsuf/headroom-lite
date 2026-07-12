@@ -12,7 +12,7 @@ const ARTIFACT_ROOT = join(__dirname, '.artifacts', 'observability-ledger');
 const LEDGER_MODULE_PATH = join(__dirname, '..', 'src', 'observability', 'ledger.mjs');
 
 after(() => {
-  rmSync(join(__dirname, '.artifacts'), { recursive: true, force: true });
+  rmSync(ARTIFACT_ROOT, { recursive: true, force: true });
 });
 
 beforeEach(() => {
@@ -145,10 +145,122 @@ try {
 }
 `;
 
+const RENEWING_LOCK_HOLDER_CHILD = `
+import { createRequire, syncBuiltinESMExports } from 'node:module';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const [, modulePath, ledgerPath, blockedPath, releasePath] = process.argv;
+const require = createRequire(import.meta.url);
+const fs = require('node:fs');
+const originalReadFileSync = fs.readFileSync;
+
+const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const heartbeatPath = join(\`\${ledgerPath}.lock\`, 'heartbeat');
+
+const { createTelemetryLedger } = await import(pathToFileURL(modulePath).href);
+const ledger = createTelemetryLedger({ path: ledgerPath });
+ledger.recordCompression({
+  tokensBefore: 100,
+  tokensAfter: 40,
+  latencyMs: 11,
+  outcome: 'ok',
+  provider: 'anthropic',
+  model: 'claude-sonnet-4.5',
+});
+
+let blocked = false;
+fs.readFileSync = function patchedReadFileSync(path, ...args) {
+  const textPath = typeof path === 'string' ? path : path?.toString?.();
+  if (!blocked && textPath === ledgerPath) {
+    blocked = true;
+    const content = originalReadFileSync(path, ...args);
+    fs.writeFileSync(blockedPath, 'blocked\\n', 'utf8');
+    while (!fs.existsSync(releasePath)) {
+      if (fs.existsSync(heartbeatPath)) {
+        fs.writeFileSync(heartbeatPath, \`\${Date.now()}\\n\`, 'utf8');
+      }
+      sleep(50);
+    }
+    return content;
+  }
+  return originalReadFileSync(path, ...args);
+};
+syncBuiltinESMExports();
+
+try {
+  ledger.flush();
+} catch (error) {
+  console.error(error?.stack ?? error);
+  process.exitCode = 1;
+}
+`;
+
+const LOCK_CONTENDER_CHILD = `
+import { createRequire, syncBuiltinESMExports } from 'node:module';
+import { pathToFileURL } from 'node:url';
+
+const [, modulePath, ledgerPath, enteredPath] = process.argv;
+const require = createRequire(import.meta.url);
+const fs = require('node:fs');
+const originalReadFileSync = fs.readFileSync;
+
+let entered = false;
+fs.readFileSync = function patchedReadFileSync(path, ...args) {
+  const textPath = typeof path === 'string' ? path : path?.toString?.();
+  if (!entered && textPath === ledgerPath) {
+    entered = true;
+    fs.writeFileSync(enteredPath, 'entered\\n', 'utf8');
+  }
+  return originalReadFileSync(path, ...args);
+};
+syncBuiltinESMExports();
+
+const { createTelemetryLedger } = await import(pathToFileURL(modulePath).href);
+const ledger = createTelemetryLedger({ path: ledgerPath });
+ledger.recordCompression({
+  tokensBefore: 80,
+  tokensAfter: 30,
+  latencyMs: 7,
+  outcome: 'ok',
+  provider: 'anthropic',
+  model: 'claude-sonnet-4.5',
+});
+
+try {
+  ledger.flush();
+} catch (error) {
+  console.error(error?.stack ?? error);
+  process.exitCode = 1;
+}
+`;
+
 async function waitForChildExit(child) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    assert.equal(child.signalCode, null);
+    assert.equal(child.exitCode, 0);
+    return;
+  }
   const [code, signal] = await once(child, 'exit');
   assert.equal(signal, null);
   assert.equal(code, 0);
+}
+
+async function waitForChildExitWithTimeout(child, timeoutMs = 5_000) {
+  let timer;
+  try {
+    await Promise.race([
+      waitForChildExit(child),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          child.kill('SIGKILL');
+          reject(new Error(`timed out waiting for child ${child.pid}`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function waitForPath(path, timeoutMs = 2_000) {
@@ -511,6 +623,57 @@ describe('telemetry ledger', () => {
     const finalPoint = persisted.history_points.at(-1);
     assert.equal(finalPoint.compression.requests, 2);
     assert.equal(finalPoint.compression.tokens_saved, 110);
+  });
+
+  it('does not let a contender enter a renewed lock after the stale threshold passes', async () => {
+    const path = writePersistedLedger('renewed-lock.json', createEmptyPersistedLedgerPayload());
+    const blockedPath = ledgerPath('renewed-lock.blocked');
+    const releasePath = ledgerPath('renewed-lock.release');
+    const enteredPath = ledgerPath('renewed-lock.entered');
+    const holder = spawn(process.execPath, [
+      '--input-type=module',
+      '-e',
+      RENEWING_LOCK_HOLDER_CHILD,
+      LEDGER_MODULE_PATH,
+      path,
+      blockedPath,
+      releasePath,
+    ], {
+      stdio: ['ignore', 'ignore', 'inherit'],
+    });
+
+    await waitForPath(blockedPath);
+    await new Promise((resolve) => setTimeout(resolve, 5_200));
+
+    const contender = spawn(process.execPath, [
+      '--input-type=module',
+      '-e',
+      LOCK_CONTENDER_CHILD,
+      LEDGER_MODULE_PATH,
+      path,
+      enteredPath,
+    ], {
+      stdio: ['ignore', 'ignore', 'inherit'],
+    });
+
+    try {
+      assert.equal(await waitForPathWithTimeout(enteredPath, 300), false);
+
+      writeFileSync(releasePath, 'release\n', 'utf8');
+      await waitForPath(enteredPath);
+    } finally {
+      if (!existsSync(releasePath)) {
+        writeFileSync(releasePath, 'release\n', 'utf8');
+      }
+      await Promise.allSettled([
+        waitForChildExitWithTimeout(holder),
+        waitForChildExitWithTimeout(contender),
+      ]);
+    }
+
+    const persisted = JSON.parse(readFileSync(path, 'utf8'));
+    assert.equal(persisted.lifetime.compression.requests, 2);
+    assert.equal(persisted.lifetime.compression.tokens_saved, 110);
   });
 
   it('calculates hourly deltas from cumulative history points', () => {

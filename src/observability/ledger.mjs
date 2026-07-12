@@ -8,6 +8,9 @@ const DEFAULT_MAX_HISTORY_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const DEFAULT_PERSIST_LOCK_TIMEOUT_MS = 5_000;
 const DEFAULT_PERSIST_LOCK_RETRY_MS = 10;
 const DEFAULT_PERSIST_LOCK_STALE_MS = 5_000;
+const DEFAULT_PERSIST_LOCK_HEARTBEAT_MS = 1_000;
+const PERSIST_LOCK_OWNER_FILE = 'owner.json';
+const PERSIST_LOCK_HEARTBEAT_FILE = 'heartbeat';
 const CAPABILITIES = Object.freeze({
   snapshot: true,
   history: true,
@@ -227,12 +230,63 @@ function lockPathFor(path) {
   return `${path}.lock`;
 }
 
-function lockIsStale(lockPath, staleMs) {
+function lockOwnerPath(lockPath) {
+  return `${lockPath}/${PERSIST_LOCK_OWNER_FILE}`;
+}
+
+function lockHeartbeatPath(lockPath) {
+  return `${lockPath}/${PERSIST_LOCK_HEARTBEAT_FILE}`;
+}
+
+function readLockOwner(lockPath) {
   try {
-    return (Date.now() - statSync(lockPath).mtimeMs) >= staleMs;
+    const parsed = JSON.parse(readFileSync(lockOwnerPath(lockPath), 'utf8'));
+    if (Number.isInteger(parsed?.pid) && parsed.pid > 0) {
+      return { pid: parsed.pid };
+    }
   } catch {
-    return false;
+    return null;
   }
+  return null;
+}
+
+function writeLockOwner(lockPath) {
+  writeFileSync(lockOwnerPath(lockPath), JSON.stringify({
+    pid: process.pid,
+    acquired_at: new Date().toISOString(),
+  }), 'utf8');
+}
+
+function renewLockHeartbeat(lockPath) {
+  writeFileSync(lockHeartbeatPath(lockPath), `${Date.now()}\n`, 'utf8');
+}
+
+function lockHeartbeatAgeMs(lockPath) {
+  try {
+    return Date.now() - statSync(lockHeartbeatPath(lockPath)).mtimeMs;
+  } catch {
+    try {
+      return Date.now() - statSync(lockPath).mtimeMs;
+    } catch {
+      return Number.POSITIVE_INFINITY;
+    }
+  }
+}
+
+function processIsRunning(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+function lockCanBeReclaimed(lockPath, staleMs) {
+  if (lockHeartbeatAgeMs(lockPath) < staleMs) return false;
+  const owner = readLockOwner(lockPath);
+  return !owner || !processIsRunning(owner.pid);
 }
 
 function withPersistenceLock(path, callback) {
@@ -243,10 +297,12 @@ function withPersistenceLock(path, callback) {
   while (true) {
     try {
       mkdirSync(lockPath);
+      writeLockOwner(lockPath);
+      renewLockHeartbeat(lockPath);
       break;
     } catch (error) {
       if (error?.code !== 'EEXIST') throw error;
-      if (lockIsStale(lockPath, DEFAULT_PERSIST_LOCK_STALE_MS)) {
+      if (lockCanBeReclaimed(lockPath, DEFAULT_PERSIST_LOCK_STALE_MS)) {
         rmSync(lockPath, { recursive: true, force: true });
         continue;
       }
@@ -258,9 +314,26 @@ function withPersistenceLock(path, callback) {
     }
   }
 
+  const heartbeatTimer = setInterval(() => {
+    try {
+      renewLockHeartbeat(lockPath);
+    } catch {
+      // Best-effort heartbeat updates; the owner PID check still prevents
+      // healthy holders from being reclaimed if the timer misses a beat.
+    }
+  }, DEFAULT_PERSIST_LOCK_HEARTBEAT_MS);
+  heartbeatTimer.unref?.();
+
   try {
-    return callback();
+    return callback(() => {
+      try {
+        renewLockHeartbeat(lockPath);
+      } catch {
+        // Best-effort manual renewals use the same safety model as the timer.
+      }
+    });
   } finally {
+    clearInterval(heartbeatTimer);
     rmSync(lockPath, { recursive: true, force: true });
   }
 }
@@ -505,9 +578,10 @@ export function createTelemetryLedger({
   const historyAgeLimitMs = maxHistoryAgeMs === undefined
     ? DEFAULT_MAX_HISTORY_AGE_MS
     : normalizeNumber(maxHistoryAgeMs);
-  const state = withPersistenceLock(path, () => {
+  const state = withPersistenceLock(path, (renewLock) => {
     const capturedAt = new Date(now());
     const loaded = loadAggregateState(path);
+    renewLock();
     const prunedHistory = pruneHistory(
       loaded.historyPoints,
       capturedAt,
@@ -537,6 +611,7 @@ export function createTelemetryLedger({
         historyBaseline: nextState.historyBaseline,
         historyPoints: nextState.historyPoints,
       }));
+      renewLock();
     }
 
     return nextState;
@@ -659,9 +734,10 @@ export function createTelemetryLedger({
   }
 
   function flush() {
-    return withPersistenceLock(path, () => {
+    return withPersistenceLock(path, (renewLock) => {
       const capturedAt = new Date(now());
       const latest = loadAggregateState(path);
+      renewLock();
       const latestPrunedHistory = pruneHistory(
         latest.historyPoints,
         capturedAt,
@@ -687,6 +763,7 @@ export function createTelemetryLedger({
       state.historyBaseline = prunedHistory.baselinePoint;
       state.historyPoints = prunedHistory.points;
 
+      renewLock();
       writePersistedState(path, createPersistedState({
         capturedAt,
         lifetime: state.lifetime,
