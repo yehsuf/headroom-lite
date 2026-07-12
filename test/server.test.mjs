@@ -46,6 +46,21 @@ function ledgerPath(name = 'stats.json') {
   return join(ARTIFACT_ROOT, name);
 }
 
+async function importFreshServerModule(homeDirectory, tag) {
+  mkdirSync(homeDirectory, { recursive: true });
+  const previousHome = process.env.HOME;
+  process.env.HOME = homeDirectory;
+  try {
+    return await import(new URL(`../src/server.mjs?${tag}`, import.meta.url).href);
+  } finally {
+    if (previousHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = previousHome;
+    }
+  }
+}
+
 async function closeServer(server) {
   await new Promise((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
@@ -246,10 +261,11 @@ describe('HTTP server', () => {
   });
 
   it('serves csv stats history and rejects unsupported history queries', async () => {
-    const [csv, badFormat, badSeries] = await Promise.all([
+    const [csv, badFormat, badSeries, unexpectedKey] = await Promise.all([
       fetch(`${baseUrl}/stats-history?series=hourly&format=csv`),
       fetch(`${baseUrl}/stats-history?series=hourly&format=xml`),
       fetch(`${baseUrl}/stats-history?series=yearly`),
+      fetch(`${baseUrl}/stats-history?series=hourly&unexpected=1`),
     ]);
 
     assert.equal(csv.status, 200);
@@ -264,6 +280,11 @@ describe('HTTP server', () => {
     assert.equal(badSeries.status, 400);
     assert.deepEqual(await badSeries.json(), {
       error: 'series must be one of "history", "hourly", "daily", "weekly", or "monthly"',
+    });
+
+    assert.equal(unexpectedKey.status, 400);
+    assert.deepEqual(await unexpectedKey.json(), {
+      error: 'unsupported stats-history query parameter: unexpected',
     });
   });
 
@@ -558,6 +579,40 @@ describe('HTTP server', () => {
       port: 0,
       maxBodyBytes: 1024 * 1024,
       telemetryLedger: secondLedger,
+    });
+    const firstAddress = firstServer.address();
+    const secondAddress = secondServer.address();
+
+    try {
+      const compress = await fetch(`http://127.0.0.1:${firstAddress.port}/v1/compress`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+      });
+      assert.equal(compress.status, 200);
+
+      const stats = await (await fetch(`http://127.0.0.1:${secondAddress.port}/stats`)).json();
+      assert.equal(stats.compress_requests, 0);
+      assert.equal(stats.session.compression.requests, 0);
+    } finally {
+      await closeServer(firstServer);
+      await closeServer(secondServer);
+    }
+  });
+
+  it('keeps default server stats isolated across startServer instances', async () => {
+    const defaultHome = join(ARTIFACT_ROOT, 'default-home');
+    const tag = `default-stats-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const { startServer: startDefaultServer } = await importFreshServerModule(defaultHome, tag);
+    const firstServer = await startDefaultServer({
+      host: '127.0.0.1',
+      port: 0,
+      maxBodyBytes: 1024 * 1024,
+    });
+    const secondServer = await startDefaultServer({
+      host: '127.0.0.1',
+      port: 0,
+      maxBodyBytes: 1024 * 1024,
     });
     const firstAddress = firstServer.address();
     const secondAddress = secondServer.address();

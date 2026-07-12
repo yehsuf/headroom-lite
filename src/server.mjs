@@ -33,8 +33,8 @@ const TELEMETRY_HISTORY_SERIES = Object.freeze([
   'proxy.requests',
   'proxy.latency_ms',
 ]);
+const STATS_HISTORY_QUERY_KEYS = new Set(['format', 'series']);
 const DEFAULT_TELEMETRY_PATH = join(homedir(), '.headroom-lite', 'telemetry.json');
-let defaultTelemetryLedger;
 
 function createLegacyStatsState() {
   return {
@@ -47,10 +47,8 @@ function createLegacyStatsState() {
 }
 
 // ── In-memory stats counters (reset on process restart) ──────────────────────
-const defaultStatsState = createLegacyStatsState();
-
 /** Read-only snapshot — safe to JSON.serialize directly. */
-export function getStats(statsState = defaultStatsState) {
+export function getStats(statsState = createLegacyStatsState()) {
   const uptimeSec = Math.floor((Date.now() - statsState.startedAt) / 1000);
   const saved = statsState.compressTokensBefore - statsState.compressTokensAfter;
   const pct = statsState.compressTokensBefore > 0
@@ -91,7 +89,7 @@ function createEmptyAggregate() {
   };
 }
 
-function createCompatibilitySnapshot(capturedAt = new Date(), statsState = defaultStatsState) {
+function createCompatibilitySnapshot(capturedAt = new Date(), statsState = createLegacyStatsState()) {
   const legacy = getStats(statsState);
   const aggregate = createEmptyAggregate();
   aggregate.compression.requests = legacy.compress_requests;
@@ -118,7 +116,7 @@ function createCompatibilitySnapshot(capturedAt = new Date(), statsState = defau
   };
 }
 
-function getTelemetrySnapshot(telemetryLedger, statsState = defaultStatsState) {
+function getTelemetrySnapshot(telemetryLedger, statsState = createLegacyStatsState()) {
   if (!telemetryLedger || typeof telemetryLedger.snapshot !== 'function') {
     return createCompatibilitySnapshot(new Date(), statsState);
   }
@@ -163,6 +161,15 @@ function normalizeHistoryFormat(value) {
   const normalized = typeof value === 'string' ? value.trim().toLowerCase() : 'json';
   if (normalized === 'json' || normalized === 'csv') return normalized;
   throw new HttpError(400, 'format must be "json" or "csv"');
+}
+
+function validateStatsHistoryQuery(searchParams) {
+  const unexpected = [...new Set([...searchParams.keys()].filter((key) => !STATS_HISTORY_QUERY_KEYS.has(key)))].sort();
+  if (unexpected.length === 0) return;
+  throw new HttpError(
+    400,
+    `unsupported stats-history query parameter${unexpected.length === 1 ? '' : 's'}: ${unexpected.join(', ')}`,
+  );
 }
 
 function startOfWeek(date) {
@@ -334,11 +341,7 @@ function observeProxyOutcome(response, telemetryLedger, telemetryState, { provid
 }
 
 function resolveTelemetryLedger(telemetryLedger) {
-  if (telemetryLedger) return telemetryLedger;
-  if (!defaultTelemetryLedger) {
-    defaultTelemetryLedger = createTelemetryLedger({ path: DEFAULT_TELEMETRY_PATH });
-  }
-  return defaultTelemetryLedger;
+  return telemetryLedger ?? createTelemetryLedger({ path: DEFAULT_TELEMETRY_PATH });
 }
 
 export const DEFAULT_HOST = '127.0.0.1';
@@ -567,6 +570,7 @@ async function routeRequest(request, response, options) {
   }
 
   if (method === 'GET' && url.pathname === '/stats-history') {
+    validateStatsHistoryQuery(url.searchParams);
     const format = normalizeHistoryFormat(url.searchParams.get('format') ?? 'json');
     const series = normalizeHistorySeries(url.searchParams.get('series') ?? 'history');
     if (format === 'csv') {
@@ -659,7 +663,7 @@ export function createServer({
   };
   const resolvedTelemetryLedger = resolveTelemetryLedger(telemetryLedger);
   const telemetryState = createTelemetryState();
-  const statsState = telemetryLedger === undefined ? defaultStatsState : createLegacyStatsState();
+  const statsState = createLegacyStatsState();
 
   const server = http.createServer((request, response) => {
     routeRequest(request, response, {
