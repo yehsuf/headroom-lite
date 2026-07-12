@@ -288,6 +288,24 @@ function jsonEquals(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function hasAggregateTotals(aggregate) {
+  return Boolean(
+    aggregate.compression.requests
+    || aggregate.compression.tokens_before
+    || aggregate.compression.tokens_after
+    || aggregate.compression.tokens_saved
+    || aggregate.compression.latency_ms
+    || aggregate.proxy.requests
+    || aggregate.proxy.latency_ms
+    || Object.keys(aggregate.compression.outcomes).length
+    || Object.keys(aggregate.compression.providers).length
+    || Object.keys(aggregate.compression.models).length
+    || Object.keys(aggregate.proxy.outcomes).length
+    || Object.keys(aggregate.proxy.providers).length
+    || Object.keys(aggregate.proxy.models).length
+  );
+}
+
 function createPersistedState({
   capturedAt,
   lifetime,
@@ -392,9 +410,11 @@ export function createTelemetryLedger({
     historyBaseline: prunedHistory.baselinePoint,
     historyPoints: prunedHistory.points,
   };
+  const loadedSessionHadTotals = hasAggregateTotals(loaded.session);
 
   if (
     loaded.needsRewrite
+    || loadedSessionHadTotals
     || !jsonEquals(loaded.historyBaseline, state.historyBaseline)
     || !jsonEquals(loaded.historyPoints, state.historyPoints)
   ) {

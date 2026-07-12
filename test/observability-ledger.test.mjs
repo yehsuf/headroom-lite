@@ -144,6 +144,52 @@ describe('telemetry ledger', () => {
     assert.equal(snapshot.history.retained_points, 1);
   });
 
+  it('rewrites stale session totals to zero on startup before any new event is recorded', () => {
+    const path = ledgerPath('restart-session.json');
+    const firstClock = createClock('2026-01-01T00:00:00.000Z');
+    const firstLedger = createTelemetryLedger({ path, now: firstClock.now });
+
+    firstLedger.recordCompression({
+      tokensBefore: 50,
+      tokensAfter: 20,
+      latencyMs: 11,
+      outcome: 'ok',
+      provider: 'anthropic',
+      model: 'claude-sonnet-4.5',
+    });
+    firstLedger.recordProxy({
+      latencyMs: 17,
+      outcome: 'ok',
+      provider: 'openai',
+      model: 'gpt-5.5',
+    });
+    firstClock.set('2026-01-01T00:05:00.000Z');
+    firstLedger.flush();
+
+    const secondClock = createClock('2026-01-01T00:06:00.000Z');
+    const secondLedger = createTelemetryLedger({ path, now: secondClock.now });
+    const persisted = JSON.parse(readFileSync(path, 'utf8'));
+
+    assert.equal(persisted.session.compression.requests, 0);
+    assert.equal(persisted.session.compression.tokens_saved, 0);
+    assert.equal(persisted.session.proxy.requests, 0);
+    assert.equal(persisted.lifetime.compression.requests, 1);
+    assert.equal(persisted.lifetime.proxy.requests, 1);
+    assert.equal(secondLedger.snapshot().session.compression.requests, 0);
+
+    secondLedger.recordCompression({
+      tokensBefore: 80,
+      tokensAfter: 60,
+      latencyMs: 9,
+      outcome: 'ok',
+      provider: 'anthropic',
+      model: 'claude-sonnet-4.5',
+    });
+
+    assert.equal(secondLedger.snapshot().session.compression.requests, 1);
+    assert.equal(secondLedger.snapshot().lifetime.compression.requests, 2);
+  });
+
   it('redacts unsafe dimension labels before persistence and export', () => {
     const path = ledgerPath('redacted.json');
     const clock = createClock('2026-01-01T00:00:00.000Z');

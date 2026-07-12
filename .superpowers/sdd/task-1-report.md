@@ -49,3 +49,15 @@
 - Tests / results:
   - `cd /Users/ysufrin/Work/headroom-lite-wt-feat-observability-endpoints && node --test test/observability-ledger.test.mjs` → PASS (`11` tests passed, `0` failed)
   - `cd /Users/ysufrin/Work/headroom-lite-wt-feat-observability-endpoints && npm test` → PASS (`396` tests passed, `0` failed)
+
+## Retention Boundary Fix
+- Commit: `b98f53b` (`fix: preserve explicit zero history retention`)
+- Tests / results:
+  - `cd /Users/ysufrin/Work/headroom-lite-wt-feat-observability-endpoints && node --test test/observability-ledger.test.mjs` → PASS (`12` tests passed, `0` failed)
+  - `cd /Users/ysufrin/Work/headroom-lite-wt-feat-observability-endpoints && npm test` → PASS (exit code `0`)
+
+## Session Reset Fix
+- Summary: rewrote the durable telemetry ledger on startup when the persisted session still contained prior-run totals, so restart readers see zeroed session counters immediately while lifetime and history remain intact.
+- Tests / results:
+  - `cd /Users/ysufrin/Work/headroom-lite-wt-feat-observability-endpoints && node --test test/observability-ledger.test.mjs` → PASS (`13` tests passed, `0` failed)
+  - `cd /Users/ysufrin/Work/headroom-lite-wt-feat-observability-endpoints && npm test` → PASS (`398` tests passed, `0` failed)
