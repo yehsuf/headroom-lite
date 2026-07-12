@@ -241,7 +241,6 @@ function createTelemetryState() {
   return {
     pendingRows: new Map(),
     flushTimer: null,
-    closeFlushDone: false,
   };
 }
 
@@ -263,10 +262,17 @@ function getPendingHistoryRows(telemetryState) {
     .sort((left, right) => left.bucket_start.localeCompare(right.bucket_start) || left.series.localeCompare(right.series));
 }
 
-function flushTelemetry(telemetryLedger, telemetryState) {
+function clearTelemetryFlushTimer(telemetryState) {
+  if (telemetryState.flushTimer) {
+    clearTimeout(telemetryState.flushTimer);
+    telemetryState.flushTimer = null;
+  }
+}
+
+async function flushTelemetry(telemetryLedger, telemetryState) {
   if (!telemetryLedger?.flush) return;
   try {
-    const snapshot = telemetryLedger.flush?.();
+    const snapshot = await telemetryLedger.flush?.();
     telemetryState.pendingRows.clear();
     return snapshot;
   } catch {
@@ -276,46 +282,82 @@ function flushTelemetry(telemetryLedger, telemetryState) {
 
 function scheduleTelemetryFlush(server, telemetryLedger, telemetryState) {
   if (!telemetryLedger?.flush) {
+    let closePromise = null;
     return {
-      flushBeforeClose() {},
+      flushTelemetry() {},
+      closeAndFlushTelemetry() {
+        if (closePromise) return closePromise;
+        closePromise = new Promise((resolve, reject) => {
+          server.close((error) => (error ? reject(error) : resolve()));
+        });
+        return closePromise;
+      },
       telemetryLedger,
     };
   }
 
-  const flushBeforeClose = () => {
-    if (telemetryState.closeFlushDone) return;
-    telemetryState.closeFlushDone = true;
-    if (telemetryState.flushTimer) {
-      clearTimeout(telemetryState.flushTimer);
-      telemetryState.flushTimer = null;
+  let closeFlushPromise = null;
+  let closeAndFlushPromise = null;
+  let closeRequested = false;
+  let closeCompleted = false;
+
+  const flushTelemetryNow = () => flushTelemetry(telemetryLedger, telemetryState);
+
+  const flushAfterClose = () => {
+    if (closeFlushPromise) return closeFlushPromise;
+    clearTelemetryFlushTimer(telemetryState);
+    closeFlushPromise = Promise.resolve(flushTelemetryNow());
+    return closeFlushPromise;
+  };
+
+  const closeAndFlushTelemetry = () => {
+    if (closeAndFlushPromise) return closeAndFlushPromise;
+    clearTelemetryFlushTimer(telemetryState);
+    closeRequested = true;
+    if (closeCompleted) {
+      closeAndFlushPromise = Promise.resolve(flushAfterClose());
+      return closeAndFlushPromise;
     }
-    return flushTelemetry(telemetryLedger, telemetryState);
+    closeAndFlushPromise = new Promise((resolve, reject) => {
+      server.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        Promise.resolve(flushAfterClose()).then(resolve, reject);
+      });
+    });
+    return closeAndFlushPromise;
   };
 
   const scheduleNext = () => {
-    if (telemetryState.closeFlushDone) return;
+    if (closeRequested) return;
     const now = new Date();
     const next = new Date(now);
     next.setUTCMinutes(0, 0, 0);
     next.setUTCHours(next.getUTCHours() + 1);
     const delay = Math.max(1, next.getTime() - now.getTime() - 1);
     telemetryState.flushTimer = setTimeout(() => {
-      if (telemetryState.closeFlushDone) return;
-      flushTelemetry(telemetryLedger, telemetryState);
-      scheduleNext();
+      void (async () => {
+        if (closeRequested) return;
+        await flushTelemetryNow();
+        scheduleNext();
+      })();
     }, delay);
     telemetryState.flushTimer.unref?.();
   };
 
   scheduleNext();
-  server.on('close', flushBeforeClose);
+  server.on('close', () => {
+    closeRequested = true;
+    closeCompleted = true;
+    void flushAfterClose();
+  });
 
   return {
-    flushBeforeClose,
-    telemetryLedger: {
-      ...telemetryLedger,
-      flush: flushBeforeClose,
-    },
+    flushTelemetry: flushTelemetryNow,
+    closeAndFlushTelemetry,
+    telemetryLedger,
   };
 }
 
@@ -781,8 +823,20 @@ export function createServer({
       enumerable: false,
       writable: false,
     },
+    flushTelemetry: {
+      value: scheduledTelemetry.flushTelemetry,
+      configurable: false,
+      enumerable: false,
+      writable: false,
+    },
+    closeAndFlushTelemetry: {
+      value: scheduledTelemetry.closeAndFlushTelemetry,
+      configurable: false,
+      enumerable: false,
+      writable: false,
+    },
     flushTelemetryBeforeClose: {
-      value: scheduledTelemetry.flushBeforeClose,
+      value: scheduledTelemetry.flushTelemetry,
       configurable: false,
       enumerable: false,
       writable: false,

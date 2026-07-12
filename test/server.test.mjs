@@ -124,6 +124,10 @@ async function withEnv(overrides, callback) {
 }
 
 async function closeServer(server) {
+  if (typeof server.closeAndFlushTelemetry === 'function') {
+    await server.closeAndFlushTelemetry();
+    return;
+  }
   await new Promise((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
   });
@@ -898,10 +902,31 @@ describe('HTTP server', () => {
     });
   });
 
-  it('flushes configured telemetry before CLI shutdown on SIGTERM', async () => {
+  it('persists in-flight proxy telemetry when CLI shutdown starts on SIGTERM', async () => {
     const defaultHome = join(ARTIFACT_ROOT, `default-home-cli-${Date.now()}-${Math.random().toString(16).slice(2)}`);
     const statsPath = ledgerPath(`cli-shutdown-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
     const port = await allocatePort();
+    let releaseUpstream;
+    let resolveUpstreamStarted;
+    const upstreamStarted = new Promise((resolve) => {
+      resolveUpstreamStarted = resolve;
+    });
+    const upstreamServer = await listenServer(http.createServer((_request, response) => {
+      resolveUpstreamStarted();
+      return new Promise((resolve) => {
+        releaseUpstream = () => {
+          if (response.headersSent || response.writableEnded) return;
+          const body = JSON.stringify({ ok: true });
+          response.writeHead(200, {
+            'content-type': 'application/json; charset=utf-8',
+            'content-length': String(Buffer.byteLength(body)),
+          });
+          response.end(body);
+          resolve();
+        };
+      });
+    }));
+    const upstreamAddress = upstreamServer.address();
     const child = spawn(process.execPath, ['src/index.mjs'], {
       cwd: join(__dirname, '..'),
       env: {
@@ -910,6 +935,7 @@ describe('HTTP server', () => {
         HEADROOM_LITE_HOST: '127.0.0.1',
         HEADROOM_LITE_PORT: String(port),
         HEADROOM_LITE_STATS_PATH: statsPath,
+        HEADROOM_LITE_UPSTREAM: `http://127.0.0.1:${upstreamAddress.port}`,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -922,22 +948,24 @@ describe('HTTP server', () => {
     try {
       await waitForOutput(child.stdout, new RegExp(`listening on http://127\\.0\\.0\\.1:${port}`));
 
-      const compress = await fetch(`http://127.0.0.1:${port}/v1/compress`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ messages: [{ role: 'user', content: 'flush-on-sigterm' }] }),
-      });
-      assert.equal(compress.status, 200);
+      const proxyResponsePromise = fetch(`http://127.0.0.1:${port}/v1/models`);
+      await upstreamStarted;
 
       child.kill('SIGTERM');
+      releaseUpstream();
+      const proxyResponse = await proxyResponsePromise;
+      assert.equal(proxyResponse.status, 200);
+      assert.deepEqual(await proxyResponse.json(), { ok: true });
       const [exitCode, signal] = await once(child, 'exit');
       assert.equal(signal, null, stderr);
       assert.equal(exitCode, 0, stderr);
     } finally {
+      releaseUpstream?.();
       if (child.exitCode === null && child.signalCode === null) {
         child.kill('SIGKILL');
         await once(child, 'exit');
       }
+      await closeServer(upstreamServer);
     }
 
     await withEnv({
@@ -954,8 +982,8 @@ describe('HTTP server', () => {
 
       try {
         const stats = await (await fetch(`http://127.0.0.1:${address.port}/stats`)).json();
-        assert.equal(stats.lifetime.compression.requests, 1);
-        assert.equal(stats.session.compression.requests, 0);
+        assert.equal(stats.lifetime.proxy.requests, 1);
+        assert.equal(stats.session.proxy.requests, 0);
       } finally {
         await closeServer(server);
       }

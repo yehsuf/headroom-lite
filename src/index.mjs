@@ -22,15 +22,20 @@ async function shutdown(signal) {
 
   console.log(`[headroom-lite] received ${signal}, shutting down`);
 
+  let exitCode = 0;
   try {
-    await server.telemetryLedger?.flush?.();
+    if (typeof server.closeAndFlushTelemetry === 'function') {
+      await server.closeAndFlushTelemetry();
+    } else {
+      await new Promise((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
   } catch {
-    // Best-effort observability must never block shutdown.
+    exitCode = 1;
   }
 
-  server.close((error) => {
-    process.exit(error ? 1 : 0);
-  });
+  process.exit(exitCode);
 }
 
 process.on('SIGINT', () => {

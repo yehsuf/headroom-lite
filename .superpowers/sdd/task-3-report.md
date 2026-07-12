@@ -36,3 +36,9 @@
 
 - Normalized `HEADROOM_LITE_STATS_PATH` so leading `~/` expands via `homedir()` and explicit resolved-default paths still qualify for the default in-memory fallback when persistence setup fails.
 - Added regressions covering the explicit resolved-default fallback and `~/` expansion, including a guard that no literal workspace `~/` directory is created.
+
+## Shutdown Drain Fix
+
+- Root cause: CLI shutdown flushed telemetry before `server.close()` drained in-flight proxy responses, so `response.finish` telemetry for delayed requests could arrive after the pre-close flush and never persist.
+- Replaced the pre-close override with a close-safe server API: `server.flushTelemetry()` for explicit best-effort snapshots and idempotent `server.closeAndFlushTelemetry()` for awaited shutdown drains plus the final post-close flush.
+- Preserved signal handling while updating CLI shutdown to await `closeAndFlushTelemetry()`, and added a regression that starts shutdown during an in-flight delayed proxy request and verifies the persisted lifetime proxy telemetry after restart.
