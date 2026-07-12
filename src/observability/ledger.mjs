@@ -176,6 +176,9 @@ function normalizeHistoryPoint(value) {
 }
 
 function pruneHistory(points, now, maxHistoryPoints, maxHistoryAgeMs, baselinePoint = null) {
+  if (maxHistoryAgeMs <= 0) {
+    return { baselinePoint: null, points: [] };
+  }
   const cutoff = now.getTime() - maxHistoryAgeMs;
   const keptByAge = [];
   let nextBaseline = baselinePoint;
@@ -372,7 +375,9 @@ export function createTelemetryLedger({
   }
 
   const historyLimit = Math.max(0, Math.floor(normalizeNumber(maxHistoryPoints)));
-  const historyAgeLimitMs = normalizeNumber(maxHistoryAgeMs) || DEFAULT_MAX_HISTORY_AGE_MS;
+  const historyAgeLimitMs = maxHistoryAgeMs === undefined
+    ? DEFAULT_MAX_HISTORY_AGE_MS
+    : normalizeNumber(maxHistoryAgeMs);
   const loaded = loadAggregateState(path);
   const prunedHistory = pruneHistory(
     loaded.historyPoints,

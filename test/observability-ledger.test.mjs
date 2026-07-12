@@ -425,4 +425,36 @@ describe('telemetry ledger', () => {
     assert.deepEqual(persisted.history_points, []);
     assert.equal(persisted.history_baseline, null);
   });
+
+  it('drops all history when maxHistoryAgeMs is explicitly zero on flush and reload', () => {
+    const path = ledgerPath('zero-retention.json');
+    const clock = createClock('2026-01-01T00:00:00.000Z');
+    const ledger = createTelemetryLedger({
+      path,
+      now: clock.now,
+      maxHistoryPoints: 10,
+      maxHistoryAgeMs: 0,
+    });
+
+    ledger.recordCompression({ tokensBefore: 100, tokensAfter: 80, latencyMs: 5 });
+    clock.set('2026-01-01T01:00:00.000Z');
+
+    const flushed = ledger.flush();
+    assert.equal(flushed.history.retained_points, 0);
+    assert.deepEqual(ledger.history({ series: 'compression.tokens_saved' }), []);
+
+    const reloaded = createTelemetryLedger({
+      path,
+      now: clock.now,
+      maxHistoryPoints: 10,
+      maxHistoryAgeMs: 0,
+    });
+
+    assert.equal(reloaded.snapshot().history.retained_points, 0);
+    assert.deepEqual(reloaded.history({ series: 'compression.tokens_saved' }), []);
+
+    const persisted = JSON.parse(readFileSync(path, 'utf8'));
+    assert.deepEqual(persisted.history_points, []);
+    assert.equal(persisted.history_baseline, null);
+  });
 });
