@@ -1,10 +1,13 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 const SCHEMA_VERSION = 1;
 const SERVICE = 'headroom-lite';
 const DEFAULT_MAX_HISTORY_POINTS = 720;
 const DEFAULT_MAX_HISTORY_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const DEFAULT_PERSIST_LOCK_TIMEOUT_MS = 5_000;
+const DEFAULT_PERSIST_LOCK_RETRY_MS = 10;
+const DEFAULT_PERSIST_LOCK_STALE_MS = 5_000;
 const CAPABILITIES = Object.freeze({
   snapshot: true,
   history: true,
@@ -213,6 +216,53 @@ function createHistoryPoint(aggregate, capturedAt) {
       latency_ms: aggregate.proxy.latency_ms,
     },
   };
+}
+
+function sleepSync(delayMs) {
+  if (!(delayMs > 0)) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
+}
+
+function lockPathFor(path) {
+  return `${path}.lock`;
+}
+
+function lockIsStale(lockPath, staleMs) {
+  try {
+    return (Date.now() - statSync(lockPath).mtimeMs) >= staleMs;
+  } catch {
+    return false;
+  }
+}
+
+function withPersistenceLock(path, callback) {
+  mkdirSync(dirname(path), { recursive: true });
+  const lockPath = lockPathFor(path);
+  const deadline = Date.now() + DEFAULT_PERSIST_LOCK_TIMEOUT_MS;
+
+  while (true) {
+    try {
+      mkdirSync(lockPath);
+      break;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      if (lockIsStale(lockPath, DEFAULT_PERSIST_LOCK_STALE_MS)) {
+        rmSync(lockPath, { recursive: true, force: true });
+        continue;
+      }
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        throw new Error(`timed out waiting for telemetry persistence lock: ${path}`);
+      }
+      sleepSync(Math.min(DEFAULT_PERSIST_LOCK_RETRY_MS, remainingMs));
+    }
+  }
+
+  try {
+    return callback();
+  } finally {
+    rmSync(lockPath, { recursive: true, force: true });
+  }
 }
 
 function normalizeHistoryPoint(value) {
@@ -455,37 +505,42 @@ export function createTelemetryLedger({
   const historyAgeLimitMs = maxHistoryAgeMs === undefined
     ? DEFAULT_MAX_HISTORY_AGE_MS
     : normalizeNumber(maxHistoryAgeMs);
-  const loaded = loadAggregateState(path);
-  const prunedHistory = pruneHistory(
-    loaded.historyPoints,
-    new Date(now()),
-    historyLimit,
-    historyAgeLimitMs,
-    loaded.historyBaseline,
-  );
-  const state = {
-    lifetime: cloneAggregate(loaded.lifetime),
-    session: createAggregate(),
-    persistedSession: createAggregate(),
-    historyBaseline: prunedHistory.baselinePoint,
-    historyPoints: prunedHistory.points,
-  };
-  const loadedSessionHadTotals = hasAggregateTotals(loaded.session);
+  const state = withPersistenceLock(path, () => {
+    const capturedAt = new Date(now());
+    const loaded = loadAggregateState(path);
+    const prunedHistory = pruneHistory(
+      loaded.historyPoints,
+      capturedAt,
+      historyLimit,
+      historyAgeLimitMs,
+      loaded.historyBaseline,
+    );
+    const nextState = {
+      lifetime: cloneAggregate(loaded.lifetime),
+      session: createAggregate(),
+      persistedSession: createAggregate(),
+      historyBaseline: prunedHistory.baselinePoint,
+      historyPoints: prunedHistory.points,
+    };
+    const loadedSessionHadTotals = hasAggregateTotals(loaded.session);
 
-  if (
-    loaded.needsRewrite
-    || loadedSessionHadTotals
-    || !jsonEquals(loaded.historyBaseline, state.historyBaseline)
-    || !jsonEquals(loaded.historyPoints, state.historyPoints)
-  ) {
-    writePersistedState(path, createPersistedState({
-      capturedAt: new Date(now()),
-      lifetime: state.lifetime,
-      session: state.session,
-      historyBaseline: state.historyBaseline,
-      historyPoints: state.historyPoints,
-    }));
-  }
+    if (
+      loaded.needsRewrite
+      || loadedSessionHadTotals
+      || !jsonEquals(loaded.historyBaseline, nextState.historyBaseline)
+      || !jsonEquals(loaded.historyPoints, nextState.historyPoints)
+    ) {
+      writePersistedState(path, createPersistedState({
+        capturedAt,
+        lifetime: nextState.lifetime,
+        session: nextState.session,
+        historyBaseline: nextState.historyBaseline,
+        historyPoints: nextState.historyPoints,
+      }));
+    }
+
+    return nextState;
+  });
 
   function snapshotAt(capturedAt) {
     return {
@@ -604,41 +659,43 @@ export function createTelemetryLedger({
   }
 
   function flush() {
-    const capturedAt = new Date(now());
-    const latest = loadAggregateState(path);
-    const latestPrunedHistory = pruneHistory(
-      latest.historyPoints,
-      capturedAt,
-      historyLimit,
-      historyAgeLimitMs,
-      latest.historyBaseline,
-    );
-    const sessionDelta = diffAggregate(state.session, state.persistedSession);
-    const mergedLifetime = cloneAggregate(latest.lifetime);
-    addAggregate(mergedLifetime, sessionDelta);
+    return withPersistenceLock(path, () => {
+      const capturedAt = new Date(now());
+      const latest = loadAggregateState(path);
+      const latestPrunedHistory = pruneHistory(
+        latest.historyPoints,
+        capturedAt,
+        historyLimit,
+        historyAgeLimitMs,
+        latest.historyBaseline,
+      );
+      const sessionDelta = diffAggregate(state.session, state.persistedSession);
+      const mergedLifetime = cloneAggregate(latest.lifetime);
+      addAggregate(mergedLifetime, sessionDelta);
 
-    const mergedHistoryPoints = latestPrunedHistory.points.slice();
-    mergedHistoryPoints.push(createHistoryPoint(mergedLifetime, capturedAt));
-    const prunedHistory = pruneHistory(
-      mergedHistoryPoints,
-      capturedAt,
-      historyLimit,
-      historyAgeLimitMs,
-      latestPrunedHistory.baselinePoint,
-    );
-    state.lifetime = mergedLifetime;
-    state.persistedSession = cloneAggregate(state.session);
-    state.historyBaseline = prunedHistory.baselinePoint;
-    state.historyPoints = prunedHistory.points;
+      const mergedHistoryPoints = latestPrunedHistory.points.slice();
+      mergedHistoryPoints.push(createHistoryPoint(mergedLifetime, capturedAt));
+      const prunedHistory = pruneHistory(
+        mergedHistoryPoints,
+        capturedAt,
+        historyLimit,
+        historyAgeLimitMs,
+        latestPrunedHistory.baselinePoint,
+      );
+      state.lifetime = mergedLifetime;
+      state.persistedSession = cloneAggregate(state.session);
+      state.historyBaseline = prunedHistory.baselinePoint;
+      state.historyPoints = prunedHistory.points;
 
-    writePersistedState(path, createPersistedState({
-      capturedAt,
-      lifetime: state.lifetime,
-      session: state.session,
-      historyBaseline: state.historyBaseline,
-      historyPoints: state.historyPoints,
-    }));
-    return snapshotAt(capturedAt);
+      writePersistedState(path, createPersistedState({
+        capturedAt,
+        lifetime: state.lifetime,
+        session: state.session,
+        historyBaseline: state.historyBaseline,
+        historyPoints: state.historyPoints,
+      }));
+      return snapshotAt(capturedAt);
+    });
   }
 
   return {

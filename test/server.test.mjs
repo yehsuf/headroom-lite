@@ -522,6 +522,27 @@ describe('HTTP server', () => {
     assert.equal(payload, 'HTTP/1.1 400 Bad Request\r\n\r\n');
   });
 
+  it('keeps no-argument getStats bound to a stable module-level legacy state snapshot', async () => {
+    const defaultHome = join(ARTIFACT_ROOT, `default-get-stats-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const tag = `default-get-stats-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const originalNow = Date.now;
+    let fakeNow = 1_000;
+    Date.now = () => fakeNow;
+    try {
+      const { getStats: getFreshStats } = await importFreshServerModule(defaultHome, tag);
+      const first = getFreshStats();
+      fakeNow += 5_000;
+      const second = getFreshStats();
+
+      assert.equal(first.uptime_seconds, 0);
+      assert.equal(second.uptime_seconds, 5);
+      assert.equal(second.proxy_requests, 0);
+      assert.equal(second.compress_requests, 0);
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
   it('records successful proxy outcomes in the telemetry ledger', async () => {
     const upstreamServer = await listenServer(http.createServer((_request, response) => {
       response.writeHead(204);

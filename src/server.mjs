@@ -46,22 +46,29 @@ function createLegacyStatsState() {
   };
 }
 
+const DEFAULT_LEGACY_STATS_STATE = createLegacyStatsState();
+
+function resolveLegacyStatsState(statsState) {
+  return statsState ?? DEFAULT_LEGACY_STATS_STATE;
+}
+
 // ── In-memory stats counters (reset on process restart) ──────────────────────
 /** Read-only snapshot — safe to JSON.serialize directly. */
-export function getStats(statsState = createLegacyStatsState()) {
-  const uptimeSec = Math.floor((Date.now() - statsState.startedAt) / 1000);
-  const saved = statsState.compressTokensBefore - statsState.compressTokensAfter;
-  const pct = statsState.compressTokensBefore > 0
-    ? (saved / statsState.compressTokensBefore * 100).toFixed(1)
+export function getStats(statsState) {
+  const resolvedStatsState = resolveLegacyStatsState(statsState);
+  const uptimeSec = Math.floor((Date.now() - resolvedStatsState.startedAt) / 1000);
+  const saved = resolvedStatsState.compressTokensBefore - resolvedStatsState.compressTokensAfter;
+  const pct = resolvedStatsState.compressTokensBefore > 0
+    ? (saved / resolvedStatsState.compressTokensBefore * 100).toFixed(1)
     : '0.0';
   return {
     status: 'ok',
     service: 'headroom-lite',
     uptime_seconds: uptimeSec,
-    proxy_requests: statsState.proxyRequests,
-    compress_requests: statsState.compressRequests,
-    compress_tokens_before: statsState.compressTokensBefore,
-    compress_tokens_after: statsState.compressTokensAfter,
+    proxy_requests: resolvedStatsState.proxyRequests,
+    compress_requests: resolvedStatsState.compressRequests,
+    compress_tokens_before: resolvedStatsState.compressTokensBefore,
+    compress_tokens_after: resolvedStatsState.compressTokensAfter,
     compress_tokens_saved: saved,
     compress_pct: pct,
   };
@@ -89,7 +96,7 @@ function createEmptyAggregate() {
   };
 }
 
-function createCompatibilitySnapshot(capturedAt = new Date(), statsState = createLegacyStatsState()) {
+function createCompatibilitySnapshot(capturedAt = new Date(), statsState = DEFAULT_LEGACY_STATS_STATE) {
   const legacy = getStats(statsState);
   const aggregate = createEmptyAggregate();
   aggregate.compression.requests = legacy.compress_requests;
@@ -116,7 +123,7 @@ function createCompatibilitySnapshot(capturedAt = new Date(), statsState = creat
   };
 }
 
-function getTelemetrySnapshot(telemetryLedger, statsState = createLegacyStatsState()) {
+function getTelemetrySnapshot(telemetryLedger, statsState = DEFAULT_LEGACY_STATS_STATE) {
   if (!telemetryLedger || typeof telemetryLedger.snapshot !== 'function') {
     return createCompatibilitySnapshot(new Date(), statsState);
   }
