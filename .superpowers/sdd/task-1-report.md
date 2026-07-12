@@ -27,7 +27,7 @@
 - This report was written after the conventional commit, so it is not included in commit `1aea56e`.
 
 ## Review Fix
-- Commit: `72ad67c` (`fix: harden telemetry ledger labels and history`)
+- Commit: `5f10da7` (`fix: harden telemetry ledger labels and history`)
 - Changed files:
   - `src/observability/ledger.mjs`
   - `test/observability-ledger.test.mjs`
@@ -36,3 +36,16 @@
   - `cd /Users/ysufrin/Work/headroom-lite-wt-feat-observability-endpoints && npm test` → PASS (exit code `0`)
 - Remaining concerns:
   - Pre-existing untracked `.serena/` and `package-lock.json` remain outside this task's scope.
+
+## Legacy Migration Fix
+- Commit: `5c351c3` (`fix: migrate legacy telemetry ledger state`)
+- Changed files:
+  - `src/observability/ledger.mjs`
+  - `test/observability-ledger.test.mjs`
+- Fix summary:
+  - Sanitizes persisted legacy lifetime/session label maps on load and atomically rewrites normalized state immediately.
+  - Drops legacy retained history that has no trustworthy persisted predecessor baseline so reloads cannot overstate the first retained bucket.
+  - Adds regression coverage for legacy vulnerable-state migration and legacy history reload behavior.
+- Tests / results:
+  - `cd /Users/ysufrin/Work/headroom-lite-wt-feat-observability-endpoints && node --test test/observability-ledger.test.mjs` → PASS (`11` tests passed, `0` failed)
+  - `cd /Users/ysufrin/Work/headroom-lite-wt-feat-observability-endpoints && npm test` → PASS (`396` tests passed, `0` failed)
