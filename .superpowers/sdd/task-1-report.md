@@ -61,3 +61,9 @@
 - Tests / results:
   - `cd /Users/ysufrin/Work/headroom-lite-wt-feat-observability-endpoints && node --test test/observability-ledger.test.mjs` → PASS (`13` tests passed, `0` failed)
   - `cd /Users/ysufrin/Work/headroom-lite-wt-feat-observability-endpoints && npm test` → PASS (`398` tests passed, `0` failed)
+
+## Point Retention Fix
+- Summary: `maxHistoryPoints: 0` now prunes both retained history points and the predecessor baseline on flush/reload, so zero-point retention leaves no persisted history state behind.
+- Tests / results:
+  - `cd /Users/ysufrin/Work/headroom-lite-wt-feat-observability-endpoints && node --test test/observability-ledger.test.mjs` → PASS (`14` tests passed, `0` failed)
+  - `cd /Users/ysufrin/Work/headroom-lite-wt-feat-observability-endpoints && npm test` → PASS (`401` tests passed, `0` failed)

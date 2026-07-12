@@ -190,8 +190,7 @@ function pruneHistory(points, now, maxHistoryPoints, maxHistoryAgeMs, baselinePo
     }
   }
   if (maxHistoryPoints <= 0) {
-    if (keptByAge.length > 0) nextBaseline = keptByAge.at(-1);
-    return { baselinePoint: nextBaseline, points: [] };
+    return { baselinePoint: null, points: [] };
   }
   if (keptByAge.length > maxHistoryPoints) {
     nextBaseline = keptByAge.at(-(maxHistoryPoints + 1)) ?? nextBaseline;
