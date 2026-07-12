@@ -35,6 +35,9 @@ const TELEMETRY_HISTORY_SERIES = Object.freeze([
 ]);
 const STATS_HISTORY_QUERY_KEYS = new Set(['format', 'series']);
 const DEFAULT_TELEMETRY_PATH = join(homedir(), '.headroom-lite', 'telemetry.json');
+const DEFAULT_STATS_MAX_POINTS = 720;
+const DEFAULT_STATS_MAX_AGE_DAYS = 30;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 function createLegacyStatsState() {
   return {
@@ -238,6 +241,7 @@ function createTelemetryState() {
   return {
     pendingRows: new Map(),
     flushTimer: null,
+    closeFlushDone: false,
   };
 }
 
@@ -262,23 +266,41 @@ function getPendingHistoryRows(telemetryState) {
 function flushTelemetry(telemetryLedger, telemetryState) {
   if (!telemetryLedger?.flush) return;
   try {
-    telemetryLedger.flush?.();
+    const snapshot = telemetryLedger.flush?.();
     telemetryState.pendingRows.clear();
+    return snapshot;
   } catch {
     // Observability must never disrupt proxy/compression behavior.
   }
 }
 
 function scheduleTelemetryFlush(server, telemetryLedger, telemetryState) {
-  if (!telemetryLedger?.flush) return;
+  if (!telemetryLedger?.flush) {
+    return {
+      flushBeforeClose() {},
+      telemetryLedger,
+    };
+  }
+
+  const flushBeforeClose = () => {
+    if (telemetryState.closeFlushDone) return;
+    telemetryState.closeFlushDone = true;
+    if (telemetryState.flushTimer) {
+      clearTimeout(telemetryState.flushTimer);
+      telemetryState.flushTimer = null;
+    }
+    return flushTelemetry(telemetryLedger, telemetryState);
+  };
 
   const scheduleNext = () => {
+    if (telemetryState.closeFlushDone) return;
     const now = new Date();
     const next = new Date(now);
     next.setUTCMinutes(0, 0, 0);
     next.setUTCHours(next.getUTCHours() + 1);
     const delay = Math.max(1, next.getTime() - now.getTime() - 1);
     telemetryState.flushTimer = setTimeout(() => {
+      if (telemetryState.closeFlushDone) return;
       flushTelemetry(telemetryLedger, telemetryState);
       scheduleNext();
     }, delay);
@@ -286,10 +308,15 @@ function scheduleTelemetryFlush(server, telemetryLedger, telemetryState) {
   };
 
   scheduleNext();
-  server.on('close', () => {
-    if (telemetryState.flushTimer) clearTimeout(telemetryState.flushTimer);
-    flushTelemetry(telemetryLedger, telemetryState);
-  });
+  server.on('close', flushBeforeClose);
+
+  return {
+    flushBeforeClose,
+    telemetryLedger: {
+      ...telemetryLedger,
+      flush: flushBeforeClose,
+    },
+  };
 }
 
 function persistTelemetry(telemetryLedger, telemetryState, record, deltas) {
@@ -323,12 +350,57 @@ function observeProxyOutcome(response, telemetryLedger, telemetryState, { provid
   });
 }
 
-function resolveTelemetryLedger(telemetryLedger) {
+function parseNonNegativeIntegerOption(input, envName, defaultValue) {
+  if (input === undefined || input === null || input === '') return defaultValue;
+  const normalized = String(input).trim();
+  if (!/^(0|[1-9]\d*)$/.test(normalized)) {
+    throw new Error(`${envName} must be a non-negative integer`);
+  }
+  return Number.parseInt(normalized, 10);
+}
+
+export function resolveStatsPath(input = process.env.HEADROOM_LITE_STATS_PATH) {
+  if (input === undefined || input === null || input === '') return DEFAULT_TELEMETRY_PATH;
+  const normalized = String(input).trim();
+  if (!normalized) {
+    throw new Error('HEADROOM_LITE_STATS_PATH must be a non-empty path');
+  }
+  return normalized;
+}
+
+export function resolveStatsMaxPoints(input = process.env.HEADROOM_LITE_STATS_MAX_POINTS) {
+  return parseNonNegativeIntegerOption(input, 'HEADROOM_LITE_STATS_MAX_POINTS', DEFAULT_STATS_MAX_POINTS);
+}
+
+export function resolveStatsMaxAgeMs(input = process.env.HEADROOM_LITE_STATS_MAX_AGE_DAYS) {
+  return parseNonNegativeIntegerOption(input, 'HEADROOM_LITE_STATS_MAX_AGE_DAYS', DEFAULT_STATS_MAX_AGE_DAYS) * DAY_MS;
+}
+
+function resolveConfiguredTelemetryLedger({
+  telemetryLedger,
+  statsPathInput = process.env.HEADROOM_LITE_STATS_PATH,
+  statsMaxPointsInput = process.env.HEADROOM_LITE_STATS_MAX_POINTS,
+  statsMaxAgeDaysInput = process.env.HEADROOM_LITE_STATS_MAX_AGE_DAYS,
+} = {}) {
   if (telemetryLedger !== undefined) return telemetryLedger;
+
+  const path = resolveStatsPath(statsPathInput);
+  const maxHistoryPoints = resolveStatsMaxPoints(statsMaxPointsInput);
+  const maxHistoryAgeMs = resolveStatsMaxAgeMs(statsMaxAgeDaysInput);
+  const usingDefaultPath = statsPathInput === undefined || statsPathInput === null || statsPathInput === '';
+
   try {
-    return createTelemetryLedger({ path: DEFAULT_TELEMETRY_PATH });
-  } catch {
-    return createInMemoryTelemetryLedger();
+    return createTelemetryLedger({
+      path,
+      maxHistoryPoints,
+      maxHistoryAgeMs,
+    });
+  } catch (error) {
+    if (!usingDefaultPath) throw error;
+    return createInMemoryTelemetryLedger({
+      maxHistoryPoints,
+      maxHistoryAgeMs,
+    });
   }
 }
 
@@ -644,6 +716,9 @@ export function createServer({
   compressLive = resolveCompressLive(),
   lossyConfig = resolveLossyConfig(),
   telemetryLedger = undefined,
+  statsPathInput = process.env.HEADROOM_LITE_STATS_PATH,
+  statsMaxPointsInput = process.env.HEADROOM_LITE_STATS_MAX_POINTS,
+  statsMaxAgeDaysInput = process.env.HEADROOM_LITE_STATS_MAX_AGE_DAYS,
 } = {}) {
   const resolvedUpstreams = upstreams ?? {
     legacy: upstream,
@@ -651,7 +726,12 @@ export function createServer({
     openai: null,
     'github-models': null,
   };
-  const resolvedTelemetryLedger = resolveTelemetryLedger(telemetryLedger);
+  const resolvedTelemetryLedger = resolveConfiguredTelemetryLedger({
+    telemetryLedger,
+    statsPathInput,
+    statsMaxPointsInput,
+    statsMaxAgeDaysInput,
+  });
   const telemetryState = createTelemetryState();
   const statsState = createLegacyStatsState();
 
@@ -686,7 +766,21 @@ export function createServer({
     if (error.code === 'ECONNRESET' || !socket.writable) return;
     socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
   });
-  scheduleTelemetryFlush(server, resolvedTelemetryLedger, telemetryState);
+  const scheduledTelemetry = scheduleTelemetryFlush(server, resolvedTelemetryLedger, telemetryState);
+  Object.defineProperties(server, {
+    telemetryLedger: {
+      value: scheduledTelemetry.telemetryLedger,
+      configurable: false,
+      enumerable: false,
+      writable: false,
+    },
+    flushTelemetryBeforeClose: {
+      value: scheduledTelemetry.flushBeforeClose,
+      configurable: false,
+      enumerable: false,
+      writable: false,
+    },
+  });
 
   return server;
 }
@@ -702,6 +796,9 @@ export function startServer({
   compressLive = resolveCompressLive(),
   lossyConfig = resolveLossyConfig(),
   telemetryLedger = undefined,
+  statsPathInput = process.env.HEADROOM_LITE_STATS_PATH,
+  statsMaxPointsInput = process.env.HEADROOM_LITE_STATS_MAX_POINTS,
+  statsMaxAgeDaysInput = process.env.HEADROOM_LITE_STATS_MAX_AGE_DAYS,
 } = {}) {
   let resolvedUpstreams;
   if (upstreams !== undefined) {
@@ -711,6 +808,12 @@ export function startServer({
   } else {
     resolvedUpstreams = resolveUpstreams();
   }
+  const resolvedTelemetryLedger = resolveConfiguredTelemetryLedger({
+    telemetryLedger,
+    statsPathInput,
+    statsMaxPointsInput,
+    statsMaxAgeDaysInput,
+  });
 
   const server = createServer({
     maxBodyBytes,
@@ -719,7 +822,7 @@ export function startServer({
     compressProxy,
     compressLive,
     lossyConfig,
-    telemetryLedger,
+    telemetryLedger: resolvedTelemetryLedger,
   });
 
   return new Promise((resolve, reject) => {

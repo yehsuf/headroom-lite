@@ -1,4 +1,6 @@
 import http from 'node:http';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { after, before, describe, it } from 'node:test';
 import { strict as assert } from 'node:assert';
@@ -97,6 +99,30 @@ function patchReadOnlyDefaultTelemetryPath(homeDirectory) {
   };
 }
 
+async function withEnv(overrides, callback) {
+  const previous = new Map();
+  for (const [key, value] of Object.entries(overrides)) {
+    previous.set(key, process.env[key]);
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+
+  try {
+    return await callback();
+  } finally {
+    for (const [key, value] of previous.entries()) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+}
+
 async function closeServer(server) {
   await new Promise((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
@@ -110,6 +136,54 @@ async function listenServer(server) {
       server.off('error', reject);
       resolve(server);
     });
+  });
+}
+
+async function allocatePort() {
+  const server = await listenServer(http.createServer());
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const { port } = address;
+  await closeServer(server);
+  return port;
+}
+
+async function waitForOutput(stream, pattern, timeoutMs = 5_000) {
+  let output = '';
+
+  if (pattern.test(output)) {
+    return output;
+  }
+
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`timed out waiting for ${pattern} in output: ${output}`));
+    }, timeoutMs);
+
+    const onData = (chunk) => {
+      output += chunk.toString();
+      if (pattern.test(output)) {
+        cleanup();
+        resolve(output);
+      }
+    };
+
+    const onEnd = () => {
+      cleanup();
+      reject(new Error(`stream ended before matching ${pattern}: ${output}`));
+    };
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      stream.off('data', onData);
+      stream.off('end', onEnd);
+      stream.off('close', onEnd);
+    };
+
+    stream.on('data', onData);
+    stream.on('end', onEnd);
+    stream.on('close', onEnd);
   });
 }
 
@@ -760,6 +834,132 @@ describe('HTTP server', () => {
       await closeServer(firstServer);
       await closeServer(secondServer);
     }
+  });
+
+  it('uses validated stats env vars for default startServer telemetry', async () => {
+    const defaultHome = join(ARTIFACT_ROOT, `default-home-configured-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const statsPath = ledgerPath(`configured-stats-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
+    const tag = `configured-stats-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const maxAgeMs = 7 * 24 * 60 * 60 * 1000;
+
+    await withEnv({
+      HEADROOM_LITE_STATS_PATH: statsPath,
+      HEADROOM_LITE_STATS_MAX_POINTS: '2',
+      HEADROOM_LITE_STATS_MAX_AGE_DAYS: '7',
+    }, async () => {
+      const {
+        startServer: startConfiguredServer,
+        resolveStatsPath,
+        resolveStatsMaxPoints,
+        resolveStatsMaxAgeMs,
+      } = await importFreshServerModule(defaultHome, tag);
+
+      assert.equal(resolveStatsPath(), statsPath);
+      assert.equal(resolveStatsMaxPoints(), 2);
+      assert.equal(resolveStatsMaxAgeMs(), maxAgeMs);
+      assert.throws(() => resolveStatsPath('   '), /HEADROOM_LITE_STATS_PATH must be a non-empty path/);
+      assert.throws(() => resolveStatsMaxPoints('abc'), /HEADROOM_LITE_STATS_MAX_POINTS must be a non-negative integer/);
+      assert.throws(() => resolveStatsMaxAgeMs('-1'), /HEADROOM_LITE_STATS_MAX_AGE_DAYS must be a non-negative integer/);
+
+      const firstServer = await startConfiguredServer({
+        host: '127.0.0.1',
+        port: 0,
+        maxBodyBytes: 1024 * 1024,
+      });
+      const firstAddress = firstServer.address();
+
+      try {
+        const compress = await fetch(`http://127.0.0.1:${firstAddress.port}/v1/compress`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ messages: [{ role: 'user', content: 'persist-configured-telemetry' }] }),
+        });
+        assert.equal(compress.status, 200);
+      } finally {
+        await closeServer(firstServer);
+      }
+
+      const secondServer = await startConfiguredServer({
+        host: '127.0.0.1',
+        port: 0,
+        maxBodyBytes: 1024 * 1024,
+      });
+      const secondAddress = secondServer.address();
+
+      try {
+        const stats = await (await fetch(`http://127.0.0.1:${secondAddress.port}/stats`)).json();
+        assert.equal(stats.history.max_points, 2);
+        assert.equal(stats.history.max_age_ms, maxAgeMs);
+        assert.equal(stats.lifetime.compression.requests, 1);
+        assert.equal(stats.session.compression.requests, 0);
+      } finally {
+        await closeServer(secondServer);
+      }
+    });
+  });
+
+  it('flushes configured telemetry before CLI shutdown on SIGTERM', async () => {
+    const defaultHome = join(ARTIFACT_ROOT, `default-home-cli-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const statsPath = ledgerPath(`cli-shutdown-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
+    const port = await allocatePort();
+    const child = spawn(process.execPath, ['src/index.mjs'], {
+      cwd: join(__dirname, '..'),
+      env: {
+        ...process.env,
+        HOME: defaultHome,
+        HEADROOM_LITE_HOST: '127.0.0.1',
+        HEADROOM_LITE_PORT: String(port),
+        HEADROOM_LITE_STATS_PATH: statsPath,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stderr = '';
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    try {
+      await waitForOutput(child.stdout, new RegExp(`listening on http://127\\.0\\.0\\.1:${port}`));
+
+      const compress = await fetch(`http://127.0.0.1:${port}/v1/compress`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'flush-on-sigterm' }] }),
+      });
+      assert.equal(compress.status, 200);
+
+      child.kill('SIGTERM');
+      const [exitCode, signal] = await once(child, 'exit');
+      assert.equal(signal, null, stderr);
+      assert.equal(exitCode, 0, stderr);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL');
+        await once(child, 'exit');
+      }
+    }
+
+    await withEnv({
+      HEADROOM_LITE_STATS_PATH: statsPath,
+    }, async () => {
+      const tag = `cli-shutdown-verify-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const { startServer: startConfiguredServer } = await importFreshServerModule(defaultHome, tag);
+      const server = await startConfiguredServer({
+        host: '127.0.0.1',
+        port: 0,
+        maxBodyBytes: 1024 * 1024,
+      });
+      const address = server.address();
+
+      try {
+        const stats = await (await fetch(`http://127.0.0.1:${address.port}/stats`)).json();
+        assert.equal(stats.lifetime.compression.requests, 1);
+        assert.equal(stats.session.compression.requests, 0);
+      } finally {
+        await closeServer(server);
+      }
+    });
   });
 
   it('falls back to an in-memory default telemetry ledger when createServer cannot create the default path', async () => {

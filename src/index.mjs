@@ -14,12 +14,28 @@ const port = typeof address === 'object' && address !== null ? address.port : 'u
 
 console.log(`[${name}] v${version} listening on http://${host}:${port}`);
 
-function shutdown(signal) {
-  server.close(() => {
-    console.log(`[headroom-lite] received ${signal}, shutting down`);
-    process.exit(0);
+let shuttingDown = false;
+
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  console.log(`[headroom-lite] received ${signal}, shutting down`);
+
+  try {
+    await server.telemetryLedger?.flush?.();
+  } catch {
+    // Best-effort observability must never block shutdown.
+  }
+
+  server.close((error) => {
+    process.exit(error ? 1 : 0);
   });
 }
 
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => {
+  void shutdown('SIGINT');
+});
+process.on('SIGTERM', () => {
+  void shutdown('SIGTERM');
+});
