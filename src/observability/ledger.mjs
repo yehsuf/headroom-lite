@@ -24,6 +24,26 @@ const HISTORY_SERIES = Object.freeze([
 ]);
 const COMPRESSION_EVENT_KEYS = new Set(['tokensBefore', 'tokensAfter', 'latencyMs', 'outcome', 'provider', 'model']);
 const PROXY_EVENT_KEYS = new Set(['latencyMs', 'outcome', 'provider', 'model']);
+// Persisted/exported label dimensions must never echo raw request-derived strings.
+// Collapse them into a finite safe vocabulary so paths, IDs, auth material, bodies,
+// and responses cannot be written to disk or exposed via snapshot/Prometheus output.
+const SAFE_OUTCOME_LABELS = new Set(['ok', 'error', 'timeout', 'rejected', 'cancelled']);
+const SAFE_PROVIDER_LABELS = new Set(['anthropic', 'openai', 'github-models']);
+const SAFE_MODEL_FAMILIES = Object.freeze([
+  ['claude', 'claude'],
+  ['gpt', 'gpt'],
+  ['o1', 'gpt'],
+  ['o3', 'gpt'],
+  ['o4', 'gpt'],
+  ['gemini', 'gemini'],
+  ['llama', 'llama'],
+  ['meta-llama', 'llama'],
+  ['mistral', 'mistral'],
+  ['mixtral', 'mistral'],
+  ['deepseek', 'deepseek'],
+  ['qwen', 'qwen'],
+]);
+const SAFE_LABEL_RE = /^[a-z0-9][a-z0-9._:-]{0,63}$/;
 
 function createAggregate() {
   return {
@@ -51,13 +71,46 @@ function normalizeNumber(value) {
   return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
-function normalizeCountMap(value) {
+function normalizeLabelValue(value) {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return null;
+  return normalized;
+}
+
+function normalizeOutcomeLabel(value) {
+  const normalized = normalizeLabelValue(value);
+  if (!normalized) return null;
+  if (SAFE_OUTCOME_LABELS.has(normalized)) return normalized;
+  if (normalized === 'err' || normalized === 'failed' || normalized === 'failure') return 'error';
+  if (normalized === 'canceled') return 'cancelled';
+  return 'other';
+}
+
+function normalizeProviderLabel(value) {
+  const normalized = normalizeLabelValue(value);
+  if (!normalized) return null;
+  if (SAFE_PROVIDER_LABELS.has(normalized)) return normalized;
+  return 'other';
+}
+
+function normalizeModelLabel(value) {
+  const normalized = normalizeLabelValue(value);
+  if (!normalized || !SAFE_LABEL_RE.test(normalized)) return 'other';
+  for (const [prefix, family] of SAFE_MODEL_FAMILIES) {
+    if (normalized.startsWith(prefix)) return family;
+  }
+  return 'other';
+}
+
+function normalizeCountMap(value, normalizeLabel) {
   const normalized = {};
   if (!value || typeof value !== 'object' || Array.isArray(value)) return normalized;
   for (const [key, raw] of Object.entries(value)) {
-    if (typeof key !== 'string' || key.length === 0) continue;
+    const label = normalizeLabel(key);
+    if (!label) continue;
     const count = normalizeNumber(raw);
-    if (count > 0) normalized[key] = count;
+    if (count > 0) normalized[label] = (normalized[label] ?? 0) + count;
   }
   return normalized;
 }
@@ -72,15 +125,15 @@ function cloneAggregate(source = createAggregate()) {
   aggregate.compression.tokens_after = normalizeNumber(compression.tokens_after);
   aggregate.compression.tokens_saved = normalizeNumber(compression.tokens_saved);
   aggregate.compression.latency_ms = normalizeNumber(compression.latency_ms);
-  aggregate.compression.outcomes = normalizeCountMap(compression.outcomes);
-  aggregate.compression.providers = normalizeCountMap(compression.providers);
-  aggregate.compression.models = normalizeCountMap(compression.models);
+  aggregate.compression.outcomes = normalizeCountMap(compression.outcomes, normalizeOutcomeLabel);
+  aggregate.compression.providers = normalizeCountMap(compression.providers, normalizeProviderLabel);
+  aggregate.compression.models = normalizeCountMap(compression.models, normalizeModelLabel);
 
   aggregate.proxy.requests = normalizeNumber(proxy.requests);
   aggregate.proxy.latency_ms = normalizeNumber(proxy.latency_ms);
-  aggregate.proxy.outcomes = normalizeCountMap(proxy.outcomes);
-  aggregate.proxy.providers = normalizeCountMap(proxy.providers);
-  aggregate.proxy.models = normalizeCountMap(proxy.models);
+  aggregate.proxy.outcomes = normalizeCountMap(proxy.outcomes, normalizeOutcomeLabel);
+  aggregate.proxy.providers = normalizeCountMap(proxy.providers, normalizeProviderLabel);
+  aggregate.proxy.models = normalizeCountMap(proxy.models, normalizeModelLabel);
 
   return aggregate;
 }
@@ -122,16 +175,32 @@ function normalizeHistoryPoint(value) {
   };
 }
 
-function pruneHistory(points, now, maxHistoryPoints, maxHistoryAgeMs) {
+function pruneHistory(points, now, maxHistoryPoints, maxHistoryAgeMs, baselinePoint = null) {
   const cutoff = now.getTime() - maxHistoryAgeMs;
-  const keptByAge = points.filter((point) => new Date(point.captured_at).getTime() >= cutoff);
-  if (maxHistoryPoints <= 0) return [];
-  return keptByAge.slice(-maxHistoryPoints);
+  const keptByAge = [];
+  let nextBaseline = baselinePoint;
+  for (const point of points) {
+    if (new Date(point.captured_at).getTime() >= cutoff) {
+      keptByAge.push(point);
+    } else {
+      nextBaseline = point;
+    }
+  }
+  if (maxHistoryPoints <= 0) {
+    if (keptByAge.length > 0) nextBaseline = keptByAge.at(-1);
+    return { baselinePoint: nextBaseline, points: [] };
+  }
+  if (keptByAge.length > maxHistoryPoints) {
+    nextBaseline = keptByAge.at(-(maxHistoryPoints + 1)) ?? nextBaseline;
+  }
+  return {
+    baselinePoint: nextBaseline,
+    points: keptByAge.slice(-maxHistoryPoints),
+  };
 }
 
-function addDimensionCount(target, label) {
-  if (typeof label !== 'string') return;
-  const key = label.trim();
+function addDimensionCount(target, label, normalizeLabel) {
+  const key = normalizeLabel(label);
   if (!key) return;
   target[key] = (target[key] ?? 0) + 1;
 }
@@ -165,13 +234,13 @@ function hourBucketStart(isoTimestamp) {
   return bucket.toISOString();
 }
 
-function toHistoryRows(points, series) {
+function toHistoryRows(points, series, baselinePoint = null) {
   if (!HISTORY_SERIES.includes(series)) {
     throw new Error(`Unsupported history series: ${series}`);
   }
 
   const buckets = new Map();
-  let previous = 0;
+  let previous = baselinePoint ? seriesValue(baselinePoint, series) : 0;
   for (const point of points) {
     const current = seriesValue(point, series);
     const delta = Math.max(0, current - previous);
@@ -213,7 +282,7 @@ function appendLabeledMetrics(lines, prefix, dimensions) {
 }
 
 function loadAggregateState(path) {
-  const emptyState = { lifetime: createAggregate(), historyPoints: [] };
+  const emptyState = { lifetime: createAggregate(), historyBaseline: null, historyPoints: [] };
   if (!existsSync(path)) return emptyState;
 
   try {
@@ -221,6 +290,7 @@ function loadAggregateState(path) {
     if (!parsed || parsed.schema_version !== SCHEMA_VERSION) return emptyState;
     return {
       lifetime: cloneAggregate(parsed.lifetime),
+      historyBaseline: normalizeHistoryPoint(parsed.history_baseline),
       historyPoints: Array.isArray(parsed.history_points)
         ? parsed.history_points.map(normalizeHistoryPoint).filter(Boolean)
         : [],
@@ -243,10 +313,18 @@ export function createTelemetryLedger({
   const historyLimit = Math.max(0, Math.floor(normalizeNumber(maxHistoryPoints)));
   const historyAgeLimitMs = normalizeNumber(maxHistoryAgeMs) || DEFAULT_MAX_HISTORY_AGE_MS;
   const loaded = loadAggregateState(path);
+  const prunedHistory = pruneHistory(
+    loaded.historyPoints,
+    new Date(now()),
+    historyLimit,
+    historyAgeLimitMs,
+    loaded.historyBaseline,
+  );
   const state = {
     lifetime: cloneAggregate(loaded.lifetime),
     session: createAggregate(),
-    historyPoints: pruneHistory(loaded.historyPoints, new Date(now()), historyLimit, historyAgeLimitMs),
+    historyBaseline: prunedHistory.baselinePoint,
+    historyPoints: prunedHistory.points,
   };
 
   function snapshotAt(capturedAt) {
@@ -262,6 +340,7 @@ export function createTelemetryLedger({
         retained_points: state.historyPoints.length,
         max_points: historyLimit,
         max_age_ms: historyAgeLimitMs,
+        has_predecessor_baseline: Boolean(state.historyBaseline),
         series: [...HISTORY_SERIES],
       },
     };
@@ -280,9 +359,9 @@ export function createTelemetryLedger({
       aggregate.compression.tokens_after += tokensAfter;
       aggregate.compression.tokens_saved += tokensSaved;
       aggregate.compression.latency_ms += latencyMs;
-      addDimensionCount(aggregate.compression.outcomes, event.outcome);
-      addDimensionCount(aggregate.compression.providers, event.provider);
-      addDimensionCount(aggregate.compression.models, event.model);
+      addDimensionCount(aggregate.compression.outcomes, event.outcome, normalizeOutcomeLabel);
+      addDimensionCount(aggregate.compression.providers, event.provider, normalizeProviderLabel);
+      addDimensionCount(aggregate.compression.models, event.model, normalizeModelLabel);
     }
   }
 
@@ -293,14 +372,14 @@ export function createTelemetryLedger({
     for (const aggregate of [state.lifetime, state.session]) {
       aggregate.proxy.requests += 1;
       aggregate.proxy.latency_ms += latencyMs;
-      addDimensionCount(aggregate.proxy.outcomes, event.outcome);
-      addDimensionCount(aggregate.proxy.providers, event.provider);
-      addDimensionCount(aggregate.proxy.models, event.model);
+      addDimensionCount(aggregate.proxy.outcomes, event.outcome, normalizeOutcomeLabel);
+      addDimensionCount(aggregate.proxy.providers, event.provider, normalizeProviderLabel);
+      addDimensionCount(aggregate.proxy.models, event.model, normalizeModelLabel);
     }
   }
 
   function history({ series } = {}) {
-    return toHistoryRows(state.historyPoints, series);
+    return toHistoryRows(state.historyPoints, series, state.historyBaseline);
   }
 
   function toCsv({ series } = {}) {
@@ -367,7 +446,15 @@ export function createTelemetryLedger({
   function flush() {
     const capturedAt = new Date(now());
     state.historyPoints.push(createHistoryPoint(state.lifetime, capturedAt));
-    state.historyPoints = pruneHistory(state.historyPoints, capturedAt, historyLimit, historyAgeLimitMs);
+    const prunedHistory = pruneHistory(
+      state.historyPoints,
+      capturedAt,
+      historyLimit,
+      historyAgeLimitMs,
+      state.historyBaseline,
+    );
+    state.historyBaseline = prunedHistory.baselinePoint;
+    state.historyPoints = prunedHistory.points;
 
     const payload = JSON.stringify({
       schema_version: SCHEMA_VERSION,
@@ -377,6 +464,7 @@ export function createTelemetryLedger({
       capabilities: { ...CAPABILITIES },
       lifetime: cloneAggregate(state.lifetime),
       session: cloneAggregate(state.session),
+      history_baseline: state.historyBaseline,
       history_points: state.historyPoints,
     }, null, 2);
 

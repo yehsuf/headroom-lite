@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert';
-import { mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { after, beforeEach, describe, it } from 'node:test';
@@ -128,14 +128,60 @@ describe('telemetry ledger', () => {
     assert.equal(snapshot.lifetime.compression.tokens_saved, 30);
     assert.equal(snapshot.lifetime.compression.outcomes.ok, 1);
     assert.equal(snapshot.lifetime.compression.providers.anthropic, 1);
-    assert.equal(snapshot.lifetime.compression.models['claude-sonnet-4.5'], 1);
+    assert.equal(snapshot.lifetime.compression.models.claude, 1);
     assert.equal(snapshot.lifetime.proxy.requests, 1);
     assert.equal(snapshot.lifetime.proxy.outcomes.ok, 1);
     assert.equal(snapshot.lifetime.proxy.providers.openai, 1);
-    assert.equal(snapshot.lifetime.proxy.models['gpt-5.5'], 1);
+    assert.equal(snapshot.lifetime.proxy.models.gpt, 1);
     assert.equal(snapshot.session.compression.requests, 0);
     assert.equal(snapshot.session.proxy.requests, 0);
     assert.equal(snapshot.history.retained_points, 1);
+  });
+
+  it('redacts unsafe dimension labels before persistence and export', () => {
+    const path = ledgerPath('redacted.json');
+    const clock = createClock('2026-01-01T00:00:00.000Z');
+    const ledger = createTelemetryLedger({ path, now: clock.now });
+
+    ledger.recordCompression({
+      tokensBefore: 100,
+      tokensAfter: 70,
+      latencyMs: 15,
+      outcome: 'ok',
+      provider: 'anthropic',
+      model: 'claude-sonnet-4.5',
+    });
+    ledger.recordCompression({
+      tokensBefore: 100,
+      tokensAfter: 40,
+      latencyMs: 20,
+      outcome: '{"response":"user-body"}',
+      provider: '/Users/alice/.ssh/id_ed25519',
+      model: 'opaque-auth-token',
+    });
+    clock.set('2026-01-01T00:10:00.000Z');
+    ledger.flush();
+
+    const persisted = readFileSync(path, 'utf8');
+    assert.equal(persisted.includes('/Users/alice/.ssh/id_ed25519'), false);
+    assert.equal(persisted.includes('opaque-auth-token'), false);
+    assert.equal(persisted.includes('user-body'), false);
+
+    const reloaded = createTelemetryLedger({ path, now: clock.now });
+    const snapshot = reloaded.snapshot();
+    assert.equal(snapshot.lifetime.compression.outcomes.ok, 1);
+    assert.equal(snapshot.lifetime.compression.outcomes.other, 1);
+    assert.equal(snapshot.lifetime.compression.providers.anthropic, 1);
+    assert.equal(snapshot.lifetime.compression.providers.other, 1);
+    assert.equal(snapshot.lifetime.compression.models.claude, 1);
+    assert.equal(snapshot.lifetime.compression.models.other, 1);
+
+    const metrics = reloaded.toPrometheus();
+    assert.match(metrics, /^headroom_lite_lifetime_compression_models_total\{label="claude"\} 1$/m);
+    assert.match(metrics, /^headroom_lite_lifetime_compression_models_total\{label="other"\} 1$/m);
+    assert.doesNotMatch(metrics, /Users\/alice/);
+    assert.doesNotMatch(metrics, /opaque-auth-token/);
+    assert.doesNotMatch(metrics, /user-body/);
   });
 
   it('calculates hourly deltas from cumulative history points', () => {
@@ -191,10 +237,11 @@ describe('telemetry ledger', () => {
     assert.doesNotMatch(metrics, /request_body/);
   });
 
-  it('prunes history by age and count before flush writes', () => {
+  it('retains predecessor baseline so the first kept history bucket is not overstated after pruning', () => {
+    const path = ledgerPath('pruned.json');
     const clock = createClock('2026-01-01T00:00:00.000Z');
     const ledger = createTelemetryLedger({
-      path: ledgerPath(),
+      path,
       now: clock.now,
       maxHistoryPoints: 2,
       maxHistoryAgeMs: 2 * 60 * 60 * 1000,
@@ -214,8 +261,14 @@ describe('telemetry ledger', () => {
 
     const snapshot = ledger.snapshot();
     assert.equal(snapshot.history.retained_points, 2);
-    assert.deepEqual(ledger.history({ series: 'compression.tokens_saved' }), [
-      { series: 'compression.tokens_saved', bucket_start: '2026-01-01T01:00:00.000Z', value: 30 },
+    const reloaded = createTelemetryLedger({
+      path,
+      now: clock.now,
+      maxHistoryPoints: 2,
+      maxHistoryAgeMs: 2 * 60 * 60 * 1000,
+    });
+    assert.deepEqual(reloaded.history({ series: 'compression.tokens_saved' }), [
+      { series: 'compression.tokens_saved', bucket_start: '2026-01-01T01:00:00.000Z', value: 20 },
       { series: 'compression.tokens_saved', bucket_start: '2026-01-01T02:00:00.000Z', value: 30 },
     ]);
   });
