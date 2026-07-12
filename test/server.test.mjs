@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { after, before, describe, it } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { mkdirSync, rmSync } from 'node:fs';
@@ -71,6 +72,29 @@ async function importFreshServerModule(homeDirectory, tag) {
       process.env.HOME = previousHome;
     }
   }
+}
+
+function patchReadOnlyDefaultTelemetryPath(homeDirectory) {
+  const defaultTelemetryDir = join(homeDirectory, '.headroom-lite');
+  const require = createRequire(import.meta.url);
+  const fs = require('node:fs');
+  const originalMkdirSync = fs.mkdirSync;
+
+  fs.mkdirSync = function patchedMkdirSync(path, ...args) {
+    const textPath = typeof path === 'string' ? path : path?.toString?.();
+    if (textPath === defaultTelemetryDir) {
+      const error = new Error(`EROFS: read-only file system, mkdir '${textPath}'`);
+      error.code = 'EROFS';
+      throw error;
+    }
+    return originalMkdirSync.call(this, path, ...args);
+  };
+  syncBuiltinESMExports();
+
+  return () => {
+    fs.mkdirSync = originalMkdirSync;
+    syncBuiltinESMExports();
+  };
 }
 
 async function closeServer(server) {
@@ -738,6 +762,61 @@ describe('HTTP server', () => {
     }
   });
 
+  it('falls back to an in-memory default telemetry ledger when createServer cannot create the default path', async () => {
+    const defaultHome = join(ARTIFACT_ROOT, `default-home-readonly-create-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const tag = `default-readonly-create-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const restoreFs = patchReadOnlyDefaultTelemetryPath(defaultHome);
+    let server;
+
+    try {
+      const { createServer: createDefaultServer } = await importFreshServerModule(defaultHome, tag);
+      server = await listenServer(createDefaultServer({
+        maxBodyBytes: 1024 * 1024,
+      }));
+    } finally {
+      restoreFs();
+    }
+
+    const address = server.address();
+    try {
+      const compress = await fetch(`http://127.0.0.1:${address.port}/v1/compress`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'fallback-createServer' }] }),
+      });
+      assert.equal(compress.status, 200);
+
+      const [health, stats, history] = await Promise.all([
+        fetch(`http://127.0.0.1:${address.port}/health`),
+        fetch(`http://127.0.0.1:${address.port}/stats`),
+        fetch(`http://127.0.0.1:${address.port}/stats-history?series=hourly`),
+      ]);
+      assert.equal(health.status, 200);
+      assert.equal(stats.status, 200);
+      assert.equal(history.status, 200);
+
+      const healthBody = await health.json();
+      const statsBody = await stats.json();
+      const historyBody = await history.json();
+
+      assert.deepEqual(healthBody.capabilities, {
+        snapshot: true,
+        history: true,
+        csv: true,
+        prometheus: true,
+        flush: true,
+        persistence: false,
+      });
+      assert.deepEqual(statsBody.capabilities, healthBody.capabilities);
+      assert.equal(statsBody.compress_requests, 1);
+      assert.equal(statsBody.session.compression.requests, 1);
+      assert.equal(statsBody.lifetime.compression.requests, 1);
+      assert.ok(historyBody.rows.some((row) => row.series === 'compression.requests' && row.value >= 1));
+    } finally {
+      await closeServer(server);
+    }
+  });
+
   it('preserves default telemetry lifetime after shared-home servers close out of order', async () => {
     const defaultHome = join(ARTIFACT_ROOT, `default-home-persist-${Date.now()}-${Math.random().toString(16).slice(2)}`);
     const tag = `default-persist-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -782,6 +861,52 @@ describe('HTTP server', () => {
       assert.ok(history.rows.some((row) => row.series === 'compression.requests' && row.value >= 1));
     } finally {
       await closeServer(thirdServer);
+    }
+  });
+
+  it('falls back to an in-memory default telemetry ledger when startServer cannot create the default path', async () => {
+    const defaultHome = join(ARTIFACT_ROOT, `default-home-readonly-start-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const tag = `default-readonly-start-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const restoreFs = patchReadOnlyDefaultTelemetryPath(defaultHome);
+    let server;
+
+    try {
+      const { startServer: startDefaultServer } = await importFreshServerModule(defaultHome, tag);
+      server = await startDefaultServer({
+        host: '127.0.0.1',
+        port: 0,
+        maxBodyBytes: 1024 * 1024,
+      });
+    } finally {
+      restoreFs();
+    }
+
+    const address = server.address();
+    try {
+      const [ready, stats] = await Promise.all([
+        fetch(`http://127.0.0.1:${address.port}/readyz`),
+        fetch(`http://127.0.0.1:${address.port}/stats`),
+      ]);
+      assert.equal(ready.status, 200);
+      assert.equal(stats.status, 200);
+
+      const readyBody = await ready.json();
+      const statsBody = await stats.json();
+
+      assert.deepEqual(readyBody.capabilities, {
+        snapshot: true,
+        history: true,
+        csv: true,
+        prometheus: true,
+        flush: true,
+        persistence: false,
+      });
+      assert.deepEqual(statsBody.capabilities, readyBody.capabilities);
+      assert.equal(statsBody.status, 'ok');
+      assert.equal(statsBody.service, 'headroom-lite');
+      assert.equal(statsBody.lifetime.compression.requests, 0);
+    } finally {
+      await closeServer(server);
     }
   });
 });

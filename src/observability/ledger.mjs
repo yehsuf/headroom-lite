@@ -51,6 +51,14 @@ const SAFE_MODEL_FAMILIES = Object.freeze([
 ]);
 const SAFE_LABEL_RE = /^[a-z0-9][a-z0-9._:-]{0,63}$/;
 
+function createCapabilities({ flush = true, persistence = true } = {}) {
+  return {
+    ...CAPABILITIES,
+    flush,
+    persistence,
+  };
+}
+
 function createAggregate() {
   return {
     compression: {
@@ -219,6 +227,109 @@ function createHistoryPoint(aggregate, capturedAt) {
       latency_ms: aggregate.proxy.latency_ms,
     },
   };
+}
+
+function createLedgerSnapshot({ state, capturedAt, historyLimit, historyAgeLimitMs, capabilities }) {
+  return {
+    schema_version: SCHEMA_VERSION,
+    captured_at: capturedAt.toISOString(),
+    status: 'ok',
+    service: SERVICE,
+    capabilities: { ...capabilities },
+    lifetime: cloneAggregate(state.lifetime),
+    session: cloneAggregate(state.session),
+    history: {
+      retained_points: state.historyPoints.length,
+      max_points: historyLimit,
+      max_age_ms: historyAgeLimitMs,
+      has_predecessor_baseline: Boolean(state.historyBaseline),
+      series: [...HISTORY_SERIES],
+    },
+  };
+}
+
+function recordCompressionInState(state, event) {
+  assertAllowedEventKeys(event, COMPRESSION_EVENT_KEYS);
+  const tokensBefore = normalizeNumber(event.tokensBefore);
+  const tokensAfter = normalizeNumber(event.tokensAfter);
+  const latencyMs = normalizeNumber(event.latencyMs);
+  const tokensSaved = Math.max(0, tokensBefore - tokensAfter);
+
+  for (const aggregate of [state.lifetime, state.session]) {
+    aggregate.compression.requests += 1;
+    aggregate.compression.tokens_before += tokensBefore;
+    aggregate.compression.tokens_after += tokensAfter;
+    aggregate.compression.tokens_saved += tokensSaved;
+    aggregate.compression.latency_ms += latencyMs;
+    addDimensionCount(aggregate.compression.outcomes, event.outcome, normalizeOutcomeLabel);
+    addDimensionCount(aggregate.compression.providers, event.provider, normalizeProviderLabel);
+    addDimensionCount(aggregate.compression.models, event.model, normalizeModelLabel);
+  }
+}
+
+function recordProxyInState(state, event) {
+  assertAllowedEventKeys(event, PROXY_EVENT_KEYS);
+  const latencyMs = normalizeNumber(event.latencyMs);
+
+  for (const aggregate of [state.lifetime, state.session]) {
+    aggregate.proxy.requests += 1;
+    aggregate.proxy.latency_ms += latencyMs;
+    addDimensionCount(aggregate.proxy.outcomes, event.outcome, normalizeOutcomeLabel);
+    addDimensionCount(aggregate.proxy.providers, event.provider, normalizeProviderLabel);
+    addDimensionCount(aggregate.proxy.models, event.model, normalizeModelLabel);
+  }
+}
+
+function snapshotToPrometheus(snapshot) {
+  const lines = [
+    '# HELP headroom_lite_schema_version schema version',
+    '# TYPE headroom_lite_schema_version gauge',
+    `headroom_lite_schema_version ${SCHEMA_VERSION}`,
+  ];
+
+  const metrics = [
+    ['headroom_lite_lifetime_compression_requests_total', 'counter', 'lifetime compression requests total', snapshot.lifetime.compression.requests],
+    ['headroom_lite_lifetime_compression_tokens_before_total', 'counter', 'lifetime compression tokens before total', snapshot.lifetime.compression.tokens_before],
+    ['headroom_lite_lifetime_compression_tokens_after_total', 'counter', 'lifetime compression tokens after total', snapshot.lifetime.compression.tokens_after],
+    ['headroom_lite_lifetime_compression_tokens_saved_total', 'counter', 'lifetime compression tokens saved total', snapshot.lifetime.compression.tokens_saved],
+    ['headroom_lite_lifetime_compression_latency_ms_total', 'counter', 'lifetime compression latency milliseconds total', snapshot.lifetime.compression.latency_ms],
+    ['headroom_lite_lifetime_proxy_requests_total', 'counter', 'lifetime proxy requests total', snapshot.lifetime.proxy.requests],
+    ['headroom_lite_lifetime_proxy_latency_ms_total', 'counter', 'lifetime proxy latency milliseconds total', snapshot.lifetime.proxy.latency_ms],
+    ['headroom_lite_session_compression_requests_total', 'counter', 'session compression requests total', snapshot.session.compression.requests],
+    ['headroom_lite_session_compression_tokens_before_total', 'counter', 'session compression tokens before total', snapshot.session.compression.tokens_before],
+    ['headroom_lite_session_compression_tokens_after_total', 'counter', 'session compression tokens after total', snapshot.session.compression.tokens_after],
+    ['headroom_lite_session_compression_tokens_saved_total', 'counter', 'session compression tokens saved total', snapshot.session.compression.tokens_saved],
+    ['headroom_lite_session_compression_latency_ms_total', 'counter', 'session compression latency milliseconds total', snapshot.session.compression.latency_ms],
+    ['headroom_lite_session_proxy_requests_total', 'counter', 'session proxy requests total', snapshot.session.proxy.requests],
+    ['headroom_lite_session_proxy_latency_ms_total', 'counter', 'session proxy latency milliseconds total', snapshot.session.proxy.latency_ms],
+  ];
+
+  for (const [name, type, help, value] of metrics) {
+    lines.push(`# HELP ${name} ${help}`);
+    lines.push(`# TYPE ${name} ${type}`);
+    lines.push(`${name} ${formatMetricValue(value)}`);
+  }
+
+  lines.push('# HELP headroom_lite_lifetime_compression_outcomes_total lifetime compression outcomes by label');
+  lines.push('# TYPE headroom_lite_lifetime_compression_outcomes_total counter');
+  appendLabeledMetrics(lines, 'headroom_lite_lifetime_compression_outcomes_total', snapshot.lifetime.compression.outcomes);
+  lines.push('# HELP headroom_lite_lifetime_compression_providers_total lifetime compression providers by label');
+  lines.push('# TYPE headroom_lite_lifetime_compression_providers_total counter');
+  appendLabeledMetrics(lines, 'headroom_lite_lifetime_compression_providers_total', snapshot.lifetime.compression.providers);
+  lines.push('# HELP headroom_lite_lifetime_compression_models_total lifetime compression models by label');
+  lines.push('# TYPE headroom_lite_lifetime_compression_models_total counter');
+  appendLabeledMetrics(lines, 'headroom_lite_lifetime_compression_models_total', snapshot.lifetime.compression.models);
+  lines.push('# HELP headroom_lite_lifetime_proxy_outcomes_total lifetime proxy outcomes by label');
+  lines.push('# TYPE headroom_lite_lifetime_proxy_outcomes_total counter');
+  appendLabeledMetrics(lines, 'headroom_lite_lifetime_proxy_outcomes_total', snapshot.lifetime.proxy.outcomes);
+  lines.push('# HELP headroom_lite_lifetime_proxy_providers_total lifetime proxy providers by label');
+  lines.push('# TYPE headroom_lite_lifetime_proxy_providers_total counter');
+  appendLabeledMetrics(lines, 'headroom_lite_lifetime_proxy_providers_total', snapshot.lifetime.proxy.providers);
+  lines.push('# HELP headroom_lite_lifetime_proxy_models_total lifetime proxy models by label');
+  lines.push('# TYPE headroom_lite_lifetime_proxy_models_total counter');
+  appendLabeledMetrics(lines, 'headroom_lite_lifetime_proxy_models_total', snapshot.lifetime.proxy.models);
+
+  return lines.join('\n');
 }
 
 function sleepSync(delayMs) {
@@ -578,6 +689,7 @@ export function createTelemetryLedger({
   const historyAgeLimitMs = maxHistoryAgeMs === undefined
     ? DEFAULT_MAX_HISTORY_AGE_MS
     : normalizeNumber(maxHistoryAgeMs);
+  const capabilities = createCapabilities();
   const state = withPersistenceLock(path, (renewLock) => {
     const capturedAt = new Date(now());
     const loaded = loadAggregateState(path);
@@ -618,54 +730,21 @@ export function createTelemetryLedger({
   });
 
   function snapshotAt(capturedAt) {
-    return {
-      schema_version: SCHEMA_VERSION,
-      captured_at: capturedAt.toISOString(),
-      status: 'ok',
-      service: SERVICE,
-      capabilities: { ...CAPABILITIES },
-      lifetime: cloneAggregate(state.lifetime),
-      session: cloneAggregate(state.session),
-      history: {
-        retained_points: state.historyPoints.length,
-        max_points: historyLimit,
-        max_age_ms: historyAgeLimitMs,
-        has_predecessor_baseline: Boolean(state.historyBaseline),
-        series: [...HISTORY_SERIES],
-      },
-    };
+    return createLedgerSnapshot({
+      state,
+      capturedAt,
+      historyLimit,
+      historyAgeLimitMs,
+      capabilities,
+    });
   }
 
   function recordCompression(event) {
-    assertAllowedEventKeys(event, COMPRESSION_EVENT_KEYS);
-    const tokensBefore = normalizeNumber(event.tokensBefore);
-    const tokensAfter = normalizeNumber(event.tokensAfter);
-    const latencyMs = normalizeNumber(event.latencyMs);
-    const tokensSaved = Math.max(0, tokensBefore - tokensAfter);
-
-    for (const aggregate of [state.lifetime, state.session]) {
-      aggregate.compression.requests += 1;
-      aggregate.compression.tokens_before += tokensBefore;
-      aggregate.compression.tokens_after += tokensAfter;
-      aggregate.compression.tokens_saved += tokensSaved;
-      aggregate.compression.latency_ms += latencyMs;
-      addDimensionCount(aggregate.compression.outcomes, event.outcome, normalizeOutcomeLabel);
-      addDimensionCount(aggregate.compression.providers, event.provider, normalizeProviderLabel);
-      addDimensionCount(aggregate.compression.models, event.model, normalizeModelLabel);
-    }
+    recordCompressionInState(state, event);
   }
 
   function recordProxy(event) {
-    assertAllowedEventKeys(event, PROXY_EVENT_KEYS);
-    const latencyMs = normalizeNumber(event.latencyMs);
-
-    for (const aggregate of [state.lifetime, state.session]) {
-      aggregate.proxy.requests += 1;
-      aggregate.proxy.latency_ms += latencyMs;
-      addDimensionCount(aggregate.proxy.outcomes, event.outcome, normalizeOutcomeLabel);
-      addDimensionCount(aggregate.proxy.providers, event.provider, normalizeProviderLabel);
-      addDimensionCount(aggregate.proxy.models, event.model, normalizeModelLabel);
-    }
+    recordProxyInState(state, event);
   }
 
   function history({ series } = {}) {
@@ -681,56 +760,7 @@ export function createTelemetryLedger({
   }
 
   function toPrometheus() {
-    const snapshot = snapshotAt(new Date(now()));
-    const lines = [
-      '# HELP headroom_lite_schema_version schema version',
-      '# TYPE headroom_lite_schema_version gauge',
-      `headroom_lite_schema_version ${SCHEMA_VERSION}`,
-    ];
-
-    const metrics = [
-      ['headroom_lite_lifetime_compression_requests_total', 'counter', 'lifetime compression requests total', snapshot.lifetime.compression.requests],
-      ['headroom_lite_lifetime_compression_tokens_before_total', 'counter', 'lifetime compression tokens before total', snapshot.lifetime.compression.tokens_before],
-      ['headroom_lite_lifetime_compression_tokens_after_total', 'counter', 'lifetime compression tokens after total', snapshot.lifetime.compression.tokens_after],
-      ['headroom_lite_lifetime_compression_tokens_saved_total', 'counter', 'lifetime compression tokens saved total', snapshot.lifetime.compression.tokens_saved],
-      ['headroom_lite_lifetime_compression_latency_ms_total', 'counter', 'lifetime compression latency milliseconds total', snapshot.lifetime.compression.latency_ms],
-      ['headroom_lite_lifetime_proxy_requests_total', 'counter', 'lifetime proxy requests total', snapshot.lifetime.proxy.requests],
-      ['headroom_lite_lifetime_proxy_latency_ms_total', 'counter', 'lifetime proxy latency milliseconds total', snapshot.lifetime.proxy.latency_ms],
-      ['headroom_lite_session_compression_requests_total', 'counter', 'session compression requests total', snapshot.session.compression.requests],
-      ['headroom_lite_session_compression_tokens_before_total', 'counter', 'session compression tokens before total', snapshot.session.compression.tokens_before],
-      ['headroom_lite_session_compression_tokens_after_total', 'counter', 'session compression tokens after total', snapshot.session.compression.tokens_after],
-      ['headroom_lite_session_compression_tokens_saved_total', 'counter', 'session compression tokens saved total', snapshot.session.compression.tokens_saved],
-      ['headroom_lite_session_compression_latency_ms_total', 'counter', 'session compression latency milliseconds total', snapshot.session.compression.latency_ms],
-      ['headroom_lite_session_proxy_requests_total', 'counter', 'session proxy requests total', snapshot.session.proxy.requests],
-      ['headroom_lite_session_proxy_latency_ms_total', 'counter', 'session proxy latency milliseconds total', snapshot.session.proxy.latency_ms],
-    ];
-
-    for (const [name, type, help, value] of metrics) {
-      lines.push(`# HELP ${name} ${help}`);
-      lines.push(`# TYPE ${name} ${type}`);
-      lines.push(`${name} ${formatMetricValue(value)}`);
-    }
-
-    lines.push('# HELP headroom_lite_lifetime_compression_outcomes_total lifetime compression outcomes by label');
-    lines.push('# TYPE headroom_lite_lifetime_compression_outcomes_total counter');
-    appendLabeledMetrics(lines, 'headroom_lite_lifetime_compression_outcomes_total', snapshot.lifetime.compression.outcomes);
-    lines.push('# HELP headroom_lite_lifetime_compression_providers_total lifetime compression providers by label');
-    lines.push('# TYPE headroom_lite_lifetime_compression_providers_total counter');
-    appendLabeledMetrics(lines, 'headroom_lite_lifetime_compression_providers_total', snapshot.lifetime.compression.providers);
-    lines.push('# HELP headroom_lite_lifetime_compression_models_total lifetime compression models by label');
-    lines.push('# TYPE headroom_lite_lifetime_compression_models_total counter');
-    appendLabeledMetrics(lines, 'headroom_lite_lifetime_compression_models_total', snapshot.lifetime.compression.models);
-    lines.push('# HELP headroom_lite_lifetime_proxy_outcomes_total lifetime proxy outcomes by label');
-    lines.push('# TYPE headroom_lite_lifetime_proxy_outcomes_total counter');
-    appendLabeledMetrics(lines, 'headroom_lite_lifetime_proxy_outcomes_total', snapshot.lifetime.proxy.outcomes);
-    lines.push('# HELP headroom_lite_lifetime_proxy_providers_total lifetime proxy providers by label');
-    lines.push('# TYPE headroom_lite_lifetime_proxy_providers_total counter');
-    appendLabeledMetrics(lines, 'headroom_lite_lifetime_proxy_providers_total', snapshot.lifetime.proxy.providers);
-    lines.push('# HELP headroom_lite_lifetime_proxy_models_total lifetime proxy models by label');
-    lines.push('# TYPE headroom_lite_lifetime_proxy_models_total counter');
-    appendLabeledMetrics(lines, 'headroom_lite_lifetime_proxy_models_total', snapshot.lifetime.proxy.models);
-
-    return lines.join('\n');
+    return snapshotToPrometheus(snapshotAt(new Date(now())));
   }
 
   function flush() {
@@ -773,6 +803,88 @@ export function createTelemetryLedger({
       }));
       return snapshotAt(capturedAt);
     });
+  }
+
+  return {
+    recordCompression,
+    recordProxy,
+    snapshot() {
+      return snapshotAt(new Date(now()));
+    },
+    history,
+    toCsv,
+    toPrometheus,
+    flush,
+  };
+}
+
+export function createInMemoryTelemetryLedger({
+  now = () => new Date(),
+  maxHistoryPoints = DEFAULT_MAX_HISTORY_POINTS,
+  maxHistoryAgeMs = DEFAULT_MAX_HISTORY_AGE_MS,
+} = {}) {
+  const historyLimit = Math.max(0, Math.floor(normalizeNumber(maxHistoryPoints)));
+  const historyAgeLimitMs = maxHistoryAgeMs === undefined
+    ? DEFAULT_MAX_HISTORY_AGE_MS
+    : normalizeNumber(maxHistoryAgeMs);
+  const capabilities = createCapabilities({ persistence: false });
+  const state = {
+    lifetime: createAggregate(),
+    session: createAggregate(),
+    persistedSession: createAggregate(),
+    historyBaseline: null,
+    historyPoints: [],
+  };
+
+  function snapshotAt(capturedAt) {
+    return createLedgerSnapshot({
+      state,
+      capturedAt,
+      historyLimit,
+      historyAgeLimitMs,
+      capabilities,
+    });
+  }
+
+  function recordCompression(event) {
+    recordCompressionInState(state, event);
+  }
+
+  function recordProxy(event) {
+    recordProxyInState(state, event);
+  }
+
+  function history({ series } = {}) {
+    return toHistoryRows(state.historyPoints, series, state.historyBaseline);
+  }
+
+  function toCsv({ series } = {}) {
+    const rows = history({ series });
+    return [
+      'series,bucket_start,value',
+      ...rows.map((row) => [row.series, row.bucket_start, row.value].map(escapeCsv).join(',')),
+    ].join('\n');
+  }
+
+  function toPrometheus() {
+    return snapshotToPrometheus(snapshotAt(new Date(now())));
+  }
+
+  function flush() {
+    const capturedAt = new Date(now());
+    const mergedHistoryPoints = state.historyPoints.slice();
+    mergedHistoryPoints.push(createHistoryPoint(state.lifetime, capturedAt));
+    const prunedHistory = pruneHistory(
+      mergedHistoryPoints,
+      capturedAt,
+      historyLimit,
+      historyAgeLimitMs,
+      state.historyBaseline,
+    );
+    state.persistedSession = cloneAggregate(state.session);
+    state.historyBaseline = prunedHistory.baselinePoint;
+    state.historyPoints = prunedHistory.points;
+    return snapshotAt(capturedAt);
   }
 
   return {

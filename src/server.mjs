@@ -12,7 +12,7 @@ import { DriftDetector } from './analyze/drift-detector.mjs';
 import { injectOpenAICacheKey, resolveOpenAICacheKey } from './normalize/openai-cache-key.mjs';
 import { detectProvider } from './providers/detect.mjs';
 import { resolveUpstreams, selectUpstream } from './providers/upstreams.mjs';
-import { createTelemetryLedger } from './observability/ledger.mjs';
+import { createInMemoryTelemetryLedger, createTelemetryLedger } from './observability/ledger.mjs';
 
 const driftDetector = new DriftDetector();
 const TELEMETRY_SCHEMA_VERSION = 1;
@@ -324,7 +324,12 @@ function observeProxyOutcome(response, telemetryLedger, telemetryState, { provid
 }
 
 function resolveTelemetryLedger(telemetryLedger) {
-  return telemetryLedger ?? createTelemetryLedger({ path: DEFAULT_TELEMETRY_PATH });
+  if (telemetryLedger !== undefined) return telemetryLedger;
+  try {
+    return createTelemetryLedger({ path: DEFAULT_TELEMETRY_PATH });
+  } catch {
+    return createInMemoryTelemetryLedger();
+  }
 }
 
 export const DEFAULT_HOST = '127.0.0.1';

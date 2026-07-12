@@ -103,3 +103,20 @@
      - Result: PASS — `412` tests passed, `0` failed, `0` skipped.
 - Diff inspected:
   - Command: `cd /Users/ysufrin/Work/headroom-lite-wt-feat-observability-endpoints && git --no-pager diff --stat -- src/observability/ledger.mjs src/server.mjs test/observability-ledger.test.mjs test/server.test.mjs .superpowers/sdd/task-2-report.md && git --no-pager diff -- src/observability/ledger.mjs src/server.mjs test/observability-ledger.test.mjs test/server.test.mjs .superpowers/sdd/task-2-report.md`
+
+## Persistence Fallback Fix
+- Findings addressed:
+  1. Default `createServer()` / `startServer()` startup now falls back to an in-memory telemetry ledger when the default telemetry path cannot be created or written, so read-only `HOME` / CI environments still boot and serve observability endpoints.
+  2. The fallback ledger keeps aggregate-only telemetry APIs available while disclosing `capabilities.persistence: false`; explicitly injected telemetry ledgers still bypass the fallback path and keep their normal failure semantics.
+- TDD / verification:
+  1. Red phase:
+     - Command: `cd /Users/ysufrin/Work/headroom-lite-wt-feat-observability-endpoints && node --test test/server.test.mjs`
+     - Result: FAIL — default `createServer()` / `startServer()` startup still threw `EROFS` from `createTelemetryLedger()` when the default telemetry directory was made read-only (`18` passed, `2` failed).
+  2. Final targeted verification:
+     - Command: `cd /Users/ysufrin/Work/headroom-lite-wt-feat-observability-endpoints && node --test test/server.test.mjs`
+     - Result: PASS — `20` tests passed, `0` failed.
+  3. Final full-suite verification:
+     - Command: `cd /Users/ysufrin/Work/headroom-lite-wt-feat-observability-endpoints && npm test`
+     - Result: PASS — `414` tests passed, `0` failed, `0` skipped.
+- Diff inspected:
+  - Command: `cd /Users/ysufrin/Work/headroom-lite-wt-feat-observability-endpoints && git --no-pager diff --stat -- src/observability/ledger.mjs src/server.mjs test/server.test.mjs .superpowers/sdd/task-2-report.md && git --no-pager diff -- src/observability/ledger.mjs src/server.mjs test/server.test.mjs .superpowers/sdd/task-2-report.md`
