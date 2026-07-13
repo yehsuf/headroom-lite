@@ -177,8 +177,55 @@ describe('HTTP server', () => {
 
     assert.equal(response.status, 400);
     assert.deepEqual(await response.json(), {
-      error: '`messages` must be a JSON array',
+      error: '`messages` (or `input` with kind:"responses") must be a JSON array',
     });
+  });
+
+  it('rejects kind:"responses" with a non-array `input` even if messages is present', async () => {
+    const response = await fetch(`${baseUrl}/v1/compress`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ kind: 'responses', input: null, messages: [] }),
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), {
+      error: 'kind:"responses" requires `input` to be a JSON array',
+    });
+  });
+
+  it('compresses a Responses API `input` array (kind:"responses")', async () => {
+    const bigOutput = Array.from({ length: 60 }, (_, i) =>
+      `src/services/handler.mjs:${i}:  return process(item[${i}], ctx);`).join('\n');
+    const payload = {
+      kind: 'responses',
+      format: 'openai',
+      model: 'gpt-4o',
+      input: [
+        { type: 'function_call', id: 'fc1', call_id: 'c1', name: 'grep', arguments: '{"q":"x"}' },
+        { type: 'function_call_output', id: 'fco1', call_id: 'c1', output: bigOutput },
+        { type: 'reasoning', id: 'r1', encrypted_content: 'OPAQUE' },
+      ],
+    };
+    const response = await fetch(`${baseUrl}/v1/compress`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    // Mirrors the `input` key, not `messages`.
+    assert.ok(Array.isArray(body.input));
+    assert.equal(body.messages, undefined);
+    // The latest function_call_output (not the last item) was compressed.
+    assert.ok(body.input[1].output.length < bigOutput.length);
+    assert.ok(body.tokens_after < body.tokens_before);
+    // Passthrough fields preserved.
+    assert.equal(body.input[0].arguments, '{"q":"x"}');
+    assert.equal(body.input[2].encrypted_content, 'OPAQUE');
+    assert.equal(typeof body.frozen_count, 'number');
+    // No OpenAI cache key is emitted on the Responses path (system context lives
+    // in `instructions`, not `input`/`messages`, so a derived key would be wrong).
+    assert.equal(body.prompt_cache_key, undefined);
   });
 
   it('skips clientError writes when the socket is not writable or already reset', () => {

@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { compressMessages, compressMessagesAsync } from './compress/pipeline.mjs';
+import { compressResponsesInput } from './compress/responses.mjs';
 import { resolveLossyConfig } from './lossy/config.mjs';
 import { normalizeTools } from './normalize/tools.mjs';
 import { detectVolatileContent } from './analyze/volatile-detector.mjs';
@@ -98,8 +99,47 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
     throw new HttpError(400, 'request body must be valid JSON');
   }
 
-  if (!payload || typeof payload !== 'object' || !Array.isArray(payload.messages)) {
-    throw new HttpError(400, '`messages` must be a JSON array');
+  const isResponses = payload && typeof payload === 'object'
+    && payload.kind === 'responses' && Array.isArray(payload.input);
+
+  // A request that declares kind:"responses" MUST carry an `input` array —
+  // reject a contradictory/invalid payload rather than silently falling through
+  // to the messages path.
+  if (payload && typeof payload === 'object' && payload.kind === 'responses' && !isResponses) {
+    throw new HttpError(400, 'kind:"responses" requires `input` to be a JSON array');
+  }
+
+  if (!payload || typeof payload !== 'object'
+    || (!Array.isArray(payload.messages) && !isResponses)) {
+    throw new HttpError(400, '`messages` (or `input` with kind:"responses") must be a JSON array');
+  }
+
+  // Responses API path: compress the `input` array (typed items), mirror the key.
+  if (isResponses) {
+    const r = compressResponsesInput(payload.input, { compressLive });
+    _stats.compressRequests++;
+    _stats.compressTokensBefore += r.tokensBefore;
+    _stats.compressTokensAfter += r.tokensAfter;
+
+    const responseBody = {
+      input: r.items,
+      tokens_before: r.tokensBefore,
+      tokens_after: r.tokensAfter,
+      frozen_count: r.frozenCount,
+    };
+    const normalizedTools = Array.isArray(payload.tools)
+      ? normalizeTools(payload.tools)
+      : undefined;
+    if (normalizedTools !== undefined) responseBody.normalized_tools = normalizedTools;
+
+    // NOTE: OpenAI prompt_cache_key injection is intentionally NOT applied on the
+    // Responses path. injectOpenAICacheKey derives the key from `messages` (and a
+    // Responses request's system context lives in `instructions`, not `input`), so
+    // injecting here would emit an incomplete key. Explicit cache-key support for
+    // Responses is a separate feature; the sidecar caller does not consume the key.
+
+    writeJson(response, 200, responseBody);
+    return;
   }
 
   const result = await compressMessagesAsync(payload.messages, {
