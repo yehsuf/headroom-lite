@@ -69,6 +69,23 @@ Candidate features:
   - Similar in spirit to Headroom's `intercept_tool_results`.
   - Could compress massive read/test outputs before they ever reach the prompt.
   - Needs careful language-aware fallbacks and "never break the current task" guardrails.
+- **Lossless-verified compaction of the current (latest) turn** _(optional, low priority)_
+  - Today `compactToolOutputs` skips the latest message entirely, and this is
+    deliberate: the compaction is lossy in the general case — object→CSV drops
+    keys outside the ≥60% dominant set and flattens nested values to
+    `[object Object]`, and the string/number-array paths elide middle items
+    (`[N items omitted]`). Corrupting the fresh tool output the model is
+    actively reasoning about is worse than leaving it uncompacted.
+  - Idea: allow **only provably reversible** object-array→CSV compaction on the
+    latest turn, gated by a strict round-trip check (CSV → inverse-parse →
+    deep-equal the original array). Any mismatch, non-uniform schema, nested
+    value, or string/number array falls back to the current skip.
+  - Requires a new CSV **inverse parser** (does not exist yet) plus the
+    round-trip guard.
+  - Benefit is narrow: it only helps a uniform, scalar-only object array that
+    lands as the very last message (measured ~0% today vs ~71% when the same
+    array is historical). This shape is rare in real agent traffic, so treat it
+    as polish, not a priority.
 
 Open questions for Phase 3:
 
