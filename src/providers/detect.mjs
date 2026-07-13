@@ -10,7 +10,9 @@
  *   /v1/messages*, /v1/complete*            -> anthropic / anthropic
  *   /openai/deployments/{id}/chat/completions -> github-models / openai  (Azure-style GitHub Models)
  *   /chat/completions (root, no /v1/)     -> github-models / openai  (https://models.github.ai)
- *   /v1/chat/completions, /v1/responses*  -> openai / openai
+ *   /v1/chat/completions, <any>/responses -> openai / openai
+ *     (Responses API: /v1/responses, /v1/codex/responses, /backend-api/responses,
+ *      /backend-api/codex/responses, and bare /responses from GitHub Copilot)
  *   everything else                       -> unknown / unknown
  */
 
@@ -24,6 +26,14 @@ export const PROVIDERS = Object.freeze(['anthropic', 'openai', 'github-models', 
 export const FORMATS = Object.freeze(['anthropic', 'openai', 'unknown']);
 
 const AZURE_DEPLOYMENTS_RE = /^\/openai\/deployments\/[^/]+\/chat\/completions(?:\/|$)/;
+
+// OpenAI Responses API — matches the `responses` route as a whole path segment
+// across every provider prefix: OpenAI `/v1/responses`, ChatGPT Codex
+// `/v1/codex/responses` and `/backend-api/codex/responses`, ChatGPT backend
+// `/backend-api/responses`, and the bare `/responses` used by GitHub Copilot
+// (api.business.githubcopilot.com/responses). The segment anchors (^|/ … /|$)
+// prevent false matches like `/list-responses` or `/responses-archive`.
+const RESPONSES_API_RE = /(?:^|\/)responses(?:\/|$)/;
 
 /**
  * Detect the provider and API format from a URL pathname.
@@ -58,8 +68,8 @@ export function detectProvider(pathname) {
     return { provider: 'github-models', format: 'openai' };
   }
 
-  // OpenAI
-  if (p.includes('/chat/completions') || p.includes('/v1/responses')) {
+  // OpenAI — chat/completions or the Responses API (any provider prefix).
+  if (p.includes('/chat/completions') || RESPONSES_API_RE.test(p)) {
     return { provider: 'openai', format: 'openai' };
   }
 
