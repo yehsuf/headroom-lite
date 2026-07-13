@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.31.0] - 2026-07-13
+
+### Changed
+
+- Align the package version with upstream Headroom 0.31.0 while preserving headroom-lite's independent, deterministic, zero-runtime-dependency behavior.
+
 ## [0.1.0] - 2026-07-10
 
 Initial release.
