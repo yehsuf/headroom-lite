@@ -116,4 +116,21 @@ describe('compressResponsesInput — live zone only', () => {
     assert.deepEqual(r.items, before);
     assert.equal(r.frozenCount, 2);
   });
+
+  it('does not delete lockfile/diff content in tool output (lossless, not noise-removal)', () => {
+    // A tool output that IS a package-lock diff must be preserved — the model
+    // requested it. compactMessageText would empty it via filterDiffNoise;
+    // compactTextLossless must not.
+    const lockDiff = 'diff --git a/package-lock.json b/package-lock.json\n'
+      + 'index aaa..bbb 100644\n--- a/package-lock.json\n+++ b/package-lock.json\n'
+      + '@@ -1,20 +1,20 @@\n'
+      + Array.from({ length: 20 }, (_, i) =>
+        `-  "resolved": "https://old/${i}",\n+  "resolved": "https://new/${i}",`).join('\n');
+    assert.ok(Buffer.byteLength(lockDiff) >= RESPONSES_MIN_BYTES);
+    const items = [fco(1, lockDiff), fc(2, 'x')]; // fco is latest-of-kind, not last item
+    const r = compressResponsesInput(items);
+    assert.notEqual(r.items[0].output, '', 'lockfile diff must not be emptied');
+    assert.ok(r.items[0].output.includes('https://new/19'), 'changed lines preserved');
+    assert.ok(r.items[0].output.includes('https://old/0'), 'removed lines preserved');
+  });
 });

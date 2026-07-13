@@ -181,6 +181,18 @@ describe('HTTP server', () => {
     });
   });
 
+  it('rejects kind:"responses" with a non-array `input` even if messages is present', async () => {
+    const response = await fetch(`${baseUrl}/v1/compress`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ kind: 'responses', input: null, messages: [] }),
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), {
+      error: 'kind:"responses" requires `input` to be a JSON array',
+    });
+  });
+
   it('compresses a Responses API `input` array (kind:"responses")', async () => {
     const bigOutput = Array.from({ length: 60 }, (_, i) =>
       `src/services/handler.mjs:${i}:  return process(item[${i}], ctx);`).join('\n');

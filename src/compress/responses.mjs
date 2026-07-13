@@ -22,7 +22,7 @@
  * only the two safe fields so opaque/structural data can never be mutated.
  */
 
-import { compactMessageText } from './pipeline.mjs';
+import { compactTextLossless } from './pipeline.mjs';
 import { estimateMessageTokens } from '../lib/estimate-tokens.mjs';
 
 // Byte floor before a field is worth compacting (matches upstream OUTPUT_ITEM_MIN_BYTES).
@@ -72,12 +72,12 @@ export function identifyLiveZone(items) {
 // Compact a message `content` (string, or array of content parts). Non-text
 // parts and short text are returned untouched.
 function compactContent(content) {
-  if (bigEnough(content)) return compactMessageText(content);
+  if (bigEnough(content)) return compactTextLossless(content);
   if (Array.isArray(content)) {
     return content.map((part) => {
       if (part && typeof part === 'object'
         && TEXT_PART_TYPES.has(part.type) && bigEnough(part.text)) {
-        return { ...part, text: compactMessageText(part.text) };
+        return { ...part, text: compactTextLossless(part.text) };
       }
       return part;
     });
@@ -118,7 +118,7 @@ export function compressResponsesInput(items, { compressLive = false } = {}) {
     if (!item || typeof item !== 'object') continue;
 
     if (OUTPUT_KINDS.has(item.type)) {
-      if (bigEnough(item.output)) item.output = compactMessageText(item.output);
+      if (bigEnough(item.output)) item.output = compactTextLossless(item.output);
     } else if (item.type === 'message') {
       item.content = compactContent(item.content);
     }

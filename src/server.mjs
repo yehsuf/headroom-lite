@@ -102,6 +102,13 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
   const isResponses = payload && typeof payload === 'object'
     && payload.kind === 'responses' && Array.isArray(payload.input);
 
+  // A request that declares kind:"responses" MUST carry an `input` array —
+  // reject a contradictory/invalid payload rather than silently falling through
+  // to the messages path.
+  if (payload && typeof payload === 'object' && payload.kind === 'responses' && !isResponses) {
+    throw new HttpError(400, 'kind:"responses" requires `input` to be a JSON array');
+  }
+
   if (!payload || typeof payload !== 'object'
     || (!Array.isArray(payload.messages) && !isResponses)) {
     throw new HttpError(400, '`messages` (or `input` with kind:"responses") must be a JSON array');

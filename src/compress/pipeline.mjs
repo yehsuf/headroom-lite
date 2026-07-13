@@ -100,6 +100,25 @@ export function compactMessageText(text) {
   });
 }
 
+/**
+ * Strictly lossless variant of compactMessageText: applies ONLY the
+ * round-trip-verified `compactLossless` transforms (log/search/paths/diff-index
+ * stripping + run-collapsing). It deliberately omits `filterDiffNoise` (which
+ * DELETES lockfile/binary/whitespace diff sections) and `minifyJson` (which
+ * discards original JSON formatting). Use this for content the model is actively
+ * consuming — e.g. Responses API tool `output` fields — where dropping a
+ * lockfile diff or reformatting JSON would be data loss, not noise removal.
+ */
+export function compactTextLossless(text) {
+  return withTagProtection(text, (safeText) => {
+    let output = safeText;
+    const primaryKind = detectPrimaryCompactionKind(safeText);
+    if (primaryKind !== null) output = compactLossless(output, primaryKind);
+    if (output.includes('\n') && primaryKind !== 'log') output = compactLossless(output, 'text');
+    return output;
+  });
+}
+
 function shouldVisitText(text, key, parentKey) {
   if (typeof text !== 'string' || !text.trim()) return false;
   if (typeof key === 'string' && (SKIP_TEXT_KEYS.has(key) || SKIP_MUTATION_KEYS.has(key))) {
