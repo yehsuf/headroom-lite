@@ -65,6 +65,8 @@ describe('compressResponsesInput — live zone only', () => {
     ];
     const before = JSON.parse(JSON.stringify(items));
     const r = compressResponsesInput(items);
+    // The ORIGINAL input array is never mutated (compression works on a clone).
+    assert.deepEqual(items, before);
     // arguments untouched
     assert.equal(r.items[0].arguments, before[0].arguments);
     // reasoning opaque untouched

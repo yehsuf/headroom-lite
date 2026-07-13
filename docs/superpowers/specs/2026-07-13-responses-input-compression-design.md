@@ -68,13 +68,26 @@ fields (`output`, message text `content`) on live-zone items are ever touched.
      search/path/JSON-min/collapse-runs, tag-protected). Message `content` may
      be a string or a content-parts array (`[{type:'input_text',text}]`); only
      `text`/`input_text`/`output_text` string parts are compacted.
-  4. Cross-turn dedup (`dedupBlocks`) runs over the collected live-zone text
-     leaves (>=2) so a live output that repeats an earlier one is pointer-folded.
+  4. Cross-turn dedup is **deferred to a follow-up** (v1 is lossless compaction
+     only). Folding a repeated live output against a frozen earlier one is safe
+     but adds corpus-tracking complexity; not required for the primary win.
   5. `frozenCount` = number of items NOT in the live zone.
   6. In `compressLive` mode the latest-message protection is dropped (parity
      with the messages pipeline).
 
 No changes to the lossless compactors - they operate on plain strings.
+
+### Cache-position tradeoff (accepted, upstream-aligned)
+
+The live zone is "latest of each output kind regardless of position." If the
+latest `*_call_output` of a kind sits deep in the array (an old call with no
+newer call of that kind), compressing it rewrites mid-prefix bytes and can bust
+OpenAI's server-side prompt cache from that offset. We accept this **deliberately
+matching upstream** (`live_zone_responses.rs`): the token saving on a large tool
+output outweighs the cache discount lost on the (typically smaller) suffix, and
+the result is always lossless. A session-aware frozen-prefix boundary (upstream's
+`manifest.latest_user_message_index` + the `#1868` cc-agnostic cache work) is the
+proper long-term fix and is tracked as a follow-up.
 
 ### `server.mjs` - accept `input` + `kind` (backward compatible)
 
@@ -107,8 +120,9 @@ Old `{ "messages":[...] }` requests are unchanged (absence of `kind` = messages)
 
 - `responses.mjs` unit tests: live-zone identification; only latest of each kind
   compressed; earlier outputs + reasoning/compaction/arguments/command/diff/phase
-  byte-identical; <512B outputs untouched; content-parts arrays handled; dedup of
-  repeated live outputs; structural integrity (types/call_id/name preserved).
+  byte-identical; <512B outputs untouched; content-parts arrays handled;
+  original input array not mutated; structural integrity (types/call_id/name
+  preserved).
 - `server.mjs`: `input`+`kind` request returns compressed `input`; missing both
   keys -> 400; old `messages` path unaffected.
 - `copilot_addon.py`: a `/responses` request with `input` is compressed and
