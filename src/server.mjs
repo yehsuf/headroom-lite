@@ -125,12 +125,11 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
       : undefined;
     if (normalizedTools !== undefined) responseBody.normalized_tools = normalizedTools;
 
-    if (payload.format === 'openai' && resolveOpenAICacheKey()) {
-      const injected = injectOpenAICacheKey(payload);
-      if (injected.prompt_cache_key != null) {
-        responseBody.prompt_cache_key = injected.prompt_cache_key;
-      }
-    }
+    // NOTE: OpenAI prompt_cache_key injection is intentionally NOT applied on the
+    // Responses path. injectOpenAICacheKey derives the key from `messages` (and a
+    // Responses request's system context lives in `instructions`, not `input`), so
+    // injecting here would emit an incomplete key. Explicit cache-key support for
+    // Responses is a separate feature; the sidecar caller does not consume the key.
 
     writeJson(response, 200, responseBody);
     return;

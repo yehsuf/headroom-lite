@@ -211,6 +211,9 @@ describe('HTTP server', () => {
     assert.equal(body.input[0].arguments, '{"q":"x"}');
     assert.equal(body.input[2].encrypted_content, 'OPAQUE');
     assert.equal(typeof body.frozen_count, 'number');
+    // No OpenAI cache key is emitted on the Responses path (system context lives
+    // in `instructions`, not `input`/`messages`, so a derived key would be wrong).
+    assert.equal(body.prompt_cache_key, undefined);
   });
 
   it('skips clientError writes when the socket is not writable or already reset', () => {
