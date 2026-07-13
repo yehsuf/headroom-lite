@@ -28,8 +28,8 @@
   ],
   "scripts": {
     "start": "node src/index.mjs",
-    "test": "node --test test/**/*.test.mjs",
-    "test:watch": "node --test --watch test/**/*.test.mjs"
+    "test": "node --test",
+    "test:watch": "node --test --watch"
   },
   "engines": {
     "node": ">=20.0.0"
