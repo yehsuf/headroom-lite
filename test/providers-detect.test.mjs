@@ -55,6 +55,41 @@ describe('detectProvider', () => {
     }
   });
 
+  describe('OpenAI Responses API (cross-provider path variants)', () => {
+    // The Responses API is used by several providers with different path
+    // prefixes: OpenAI (/v1/responses), ChatGPT Codex (/v1/codex/responses,
+    // /backend-api/codex/responses), ChatGPT backend (/backend-api/responses),
+    // and GitHub Copilot (bare /responses). All are openai-format.
+    const cases = [
+      '/responses',
+      '/responses/',
+      '/responses/resp_abc123',
+      '/responses?stream=true',
+      '/v1/codex/responses',
+      '/v1/codex/responses/resp_x',
+      '/backend-api/responses',
+      '/backend-api/codex/responses',
+    ];
+    for (const p of cases) {
+      it(`detects openai for ${p}`, () => {
+        const result = detectProvider(p);
+        assert.equal(result.provider, 'openai');
+        assert.equal(result.format, 'openai');
+      });
+    }
+  });
+
+  describe('responses-like paths that must NOT match (precision guard)', () => {
+    const cases = ['/list-responses', '/responses-archive', '/myresponses'];
+    for (const p of cases) {
+      it(`returns unknown for ${p}`, () => {
+        const result = detectProvider(p);
+        assert.equal(result.provider, 'unknown');
+        assert.equal(result.format, 'unknown');
+      });
+    }
+  });
+
   describe('unknown paths', () => {
     const cases = [
       '/',
