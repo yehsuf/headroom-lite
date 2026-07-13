@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { compressMessages, compressMessagesAsync } from './compress/pipeline.mjs';
+import { compressResponsesInput } from './compress/responses.mjs';
 import { resolveLossyConfig } from './lossy/config.mjs';
 import { normalizeTools } from './normalize/tools.mjs';
 import { detectVolatileContent } from './analyze/volatile-detector.mjs';
@@ -98,8 +99,41 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
     throw new HttpError(400, 'request body must be valid JSON');
   }
 
-  if (!payload || typeof payload !== 'object' || !Array.isArray(payload.messages)) {
-    throw new HttpError(400, '`messages` must be a JSON array');
+  const isResponses = payload && typeof payload === 'object'
+    && payload.kind === 'responses' && Array.isArray(payload.input);
+
+  if (!payload || typeof payload !== 'object'
+    || (!Array.isArray(payload.messages) && !isResponses)) {
+    throw new HttpError(400, '`messages` (or `input` with kind:"responses") must be a JSON array');
+  }
+
+  // Responses API path: compress the `input` array (typed items), mirror the key.
+  if (isResponses) {
+    const r = compressResponsesInput(payload.input, { compressLive });
+    _stats.compressRequests++;
+    _stats.compressTokensBefore += r.tokensBefore;
+    _stats.compressTokensAfter += r.tokensAfter;
+
+    const responseBody = {
+      input: r.items,
+      tokens_before: r.tokensBefore,
+      tokens_after: r.tokensAfter,
+      frozen_count: r.frozenCount,
+    };
+    const normalizedTools = Array.isArray(payload.tools)
+      ? normalizeTools(payload.tools)
+      : undefined;
+    if (normalizedTools !== undefined) responseBody.normalized_tools = normalizedTools;
+
+    if (payload.format === 'openai' && resolveOpenAICacheKey()) {
+      const injected = injectOpenAICacheKey(payload);
+      if (injected.prompt_cache_key != null) {
+        responseBody.prompt_cache_key = injected.prompt_cache_key;
+      }
+    }
+
+    writeJson(response, 200, responseBody);
+    return;
   }
 
   const result = await compressMessagesAsync(payload.messages, {
