@@ -1227,3 +1227,63 @@ describe('HTTP server', () => {
     }
   });
 });
+
+describe('headroom-parity gap endpoints', () => {
+  let server;
+  let baseUrl;
+
+  before(async () => {
+    server = await startServer({
+      host: '127.0.0.1',
+      port: 0,
+      maxBodyBytes: 1024 * 1024,
+      telemetryLedger: createTelemetryLedger({ path: ledgerPath('http-parity-gaps.json') }),
+    });
+    baseUrl = `http://127.0.0.1:${server.address().port}`;
+  });
+
+  after(async () => {
+    await closeServer(server);
+  });
+
+  it('serves /healthz as an alias of /health', async () => {
+    const [health, healthz] = await Promise.all([
+      fetch(`${baseUrl}/health`),
+      fetch(`${baseUrl}/healthz`),
+    ]);
+    assert.equal(healthz.status, 200);
+    assert.deepEqual(await healthz.json(), await health.json());
+  });
+
+  it('POST /stats/reset zeroes the runtime counters', async () => {
+    await fetch(`${baseUrl}/v1/compress`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'x'.repeat(4000) }] }),
+    });
+    const before = await (await fetch(`${baseUrl}/stats`)).json();
+    assert.ok(before.compress_requests >= 1);
+
+    const reset = await fetch(`${baseUrl}/stats/reset`, { method: 'POST' });
+    assert.equal(reset.status, 200);
+    const resetBody = await reset.json();
+    assert.equal(resetBody.compress_requests, 0);
+    assert.equal(resetBody.compress_tokens_before, 0);
+    assert.equal(resetBody.compress_tokens_after, 0);
+
+    const after = await (await fetch(`${baseUrl}/stats`)).json();
+    assert.equal(after.compress_requests, 0);
+  });
+
+  it('returns 501 not-implemented for known headroom endpoints hl does not serve', async () => {
+    const paths = ['/subscription-window', '/quota', '/admin/upstream', '/v1/telemetry', '/v1/toin/stats', '/cache/clear'];
+    for (const path of paths) {
+      const r = await fetch(`${baseUrl}${path}`);
+      assert.equal(r.status, 501, `${path} should be 501`);
+      const body = await r.json();
+      assert.equal(body.error, 'not implemented');
+      assert.equal(body.service, 'headroom-lite');
+      assert.ok(typeof body.reason === 'string' && body.reason.length > 0, `${path} needs a reason`);
+    }
+  });
+});

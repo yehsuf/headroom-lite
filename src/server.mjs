@@ -55,6 +55,50 @@ function resolveLegacyStatsState(statsState) {
   return statsState ?? DEFAULT_LEGACY_STATS_STATE;
 }
 
+/** Reset the in-memory runtime counters (mirrors headroom's POST /stats/reset:
+ *  a runtime reset for local test/debug isolation). Durable telemetry history
+ *  in the ledger is intentionally left intact. */
+function resetLegacyStatsState(statsState) {
+  const s = resolveLegacyStatsState(statsState);
+  s.startedAt = Date.now();
+  s.proxyRequests = 0;
+  s.compressRequests = 0;
+  s.compressTokensBefore = 0;
+  s.compressTokensAfter = 0;
+}
+
+// Known headroom endpoints that headroom-lite deliberately does NOT implement
+// (no subscription/RAG/telemetry-ledger-write/TOIN/admin surface). They answer
+// with an explicit 501 + reason so a probe expecting headroom's API gets a
+// defined shape instead of a bare 404 or an accidental upstream proxy.
+const NOT_IMPLEMENTED_EXACT = {
+  '/subscription-window': 'headroom-lite has no subscription/budget model',
+  '/quota': 'headroom-lite has no subscription/budget model',
+  '/transformations/feed': 'headroom-lite does not buffer a transformation feed',
+  '/dashboard': 'headroom-lite serves no HTML dashboard',
+  '/cache/clear': 'headroom-lite keeps no server-side cache to clear',
+};
+const NOT_IMPLEMENTED_PREFIXES = {
+  '/admin': 'headroom-lite exposes no admin API',
+  '/debug': 'headroom-lite exposes no debug API',
+  '/v1/retrieve': 'headroom-lite has no RAG retrieval store',
+  '/v1/feedback': 'headroom-lite collects no tool feedback',
+  '/v1/telemetry': 'headroom-lite exposes telemetry via /stats, /stats-history and /metrics',
+  '/v1/toin': 'headroom-lite implements no TOIN pattern store',
+};
+
+/** Reason string if `pathname` is a known-but-unimplemented headroom endpoint,
+ *  else null. Matches exact paths and `<prefix>` / `<prefix>/...` families. */
+function notImplementedReason(pathname) {
+  if (Object.prototype.hasOwnProperty.call(NOT_IMPLEMENTED_EXACT, pathname)) {
+    return NOT_IMPLEMENTED_EXACT[pathname];
+  }
+  for (const [prefix, reason] of Object.entries(NOT_IMPLEMENTED_PREFIXES)) {
+    if (pathname === prefix || pathname.startsWith(`${prefix}/`)) return reason;
+  }
+  return null;
+}
+
 // ── In-memory stats counters (reset on process restart) ──────────────────────
 /** Read-only snapshot — safe to JSON.serialize directly. */
 export function getStats(statsState) {
@@ -529,9 +573,9 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
   // Responses API path: compress the `input` array (typed items), mirror the key.
   if (isResponses) {
     const r = compressResponsesInput(payload.input, { compressLive });
-    _stats.compressRequests++;
-    _stats.compressTokensBefore += r.tokensBefore;
-    _stats.compressTokensAfter += r.tokensAfter;
+    statsState.compressRequests++;
+    statsState.compressTokensBefore += r.tokensBefore;
+    statsState.compressTokensAfter += r.tokensAfter;
 
     const responseBody = {
       input: r.items,
@@ -551,6 +595,24 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
     // Responses is a separate feature; the sidecar caller does not consume the key.
 
     writeJson(response, 200, responseBody);
+    const latencyMs = Date.now() - startedAt;
+    const tokensSaved = Math.max(0, r.tokensBefore - r.tokensAfter);
+    persistTelemetry(telemetryLedger, telemetryState, () => {
+      telemetryLedger.recordCompression?.({
+        tokensBefore: r.tokensBefore,
+        tokensAfter: r.tokensAfter,
+        latencyMs,
+        outcome: 'ok',
+        provider: 'openai',
+        model: typeof payload.model === 'string' ? payload.model : undefined,
+      });
+    }, [
+      ['compression.requests', 1],
+      ['compression.tokens_before', r.tokensBefore],
+      ['compression.tokens_after', r.tokensAfter],
+      ['compression.tokens_saved', tokensSaved],
+      ['compression.latency_ms', latencyMs],
+    ]);
     return;
   }
 
@@ -628,7 +690,7 @@ async function routeRequest(request, response, options) {
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? '127.0.0.1'}`);
   const telemetrySnapshot = getTelemetrySnapshot(options.telemetryLedger, options.statsState);
 
-  if (method === 'GET' && url.pathname === '/health') {
+  if (method === 'GET' && (url.pathname === '/health' || url.pathname === '/healthz')) {
     // Check whether any upstream is configured
     const { upstreams, lossyConfig } = options;
     const anyUpstream = upstreams.legacy ?? upstreams.anthropic ?? upstreams.openai ?? upstreams['github-models'];
@@ -678,6 +740,12 @@ async function routeRequest(request, response, options) {
     return;
   }
 
+  if (method === 'POST' && url.pathname === '/stats/reset') {
+    resetLegacyStatsState(options.statsState);
+    writeJson(response, 200, getStats(options.statsState));
+    return;
+  }
+
   if (method === 'GET' && url.pathname === '/stats-history') {
     validateStatsHistoryQuery(url.searchParams);
     const format = normalizeHistoryFormat(url.searchParams.get('format') ?? 'json');
@@ -719,6 +787,19 @@ async function routeRequest(request, response, options) {
 
   if (method === 'POST' && url.pathname === '/v1/compress') {
     await handleCompress(request, response, options);
+    return;
+  }
+
+  // Known headroom endpoints headroom-lite doesn't implement -> explicit 501
+  // (defined shape for probes; never proxied upstream). Checked AFTER the real
+  // endpoints and BEFORE the passthrough proxy.
+  const niReason = notImplementedReason(url.pathname);
+  if (niReason) {
+    writeJson(response, 501, {
+      error: 'not implemented',
+      service: 'headroom-lite',
+      reason: niReason,
+    });
     return;
   }
 
