@@ -63,8 +63,13 @@ function createClock(initialValue = '2026-01-01T00:00:00.000Z') {
 
 async function importFreshServerModule(homeDirectory, tag) {
   mkdirSync(homeDirectory, { recursive: true });
+  // os.homedir() reads USERPROFILE on Windows and HOME on POSIX — override both
+  // so the fake home is honored cross-platform (otherwise Windows writes to the
+  // real home and the read-only-path fallback tests never trigger).
   const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
   process.env.HOME = homeDirectory;
+  process.env.USERPROFILE = homeDirectory;
   try {
     return await import(new URL(`../src/server.mjs?${tag}`, import.meta.url).href);
   } finally {
@@ -72,6 +77,11 @@ async function importFreshServerModule(homeDirectory, tag) {
       delete process.env.HOME;
     } else {
       process.env.HOME = previousHome;
+    }
+    if (previousUserProfile === undefined) {
+      delete process.env.USERPROFILE;
+    } else {
+      process.env.USERPROFILE = previousUserProfile;
     }
   }
 }
@@ -902,7 +912,11 @@ describe('HTTP server', () => {
     });
   });
 
-  it('persists in-flight proxy telemetry when CLI shutdown starts on SIGTERM', async () => {
+  it('persists in-flight proxy telemetry when CLI shutdown starts on SIGTERM', {
+    skip: process.platform === 'win32'
+      ? 'SIGTERM graceful shutdown is POSIX-only; Windows emulates SIGTERM as a hard kill'
+      : false,
+  }, async () => {
     const defaultHome = join(ARTIFACT_ROOT, `default-home-cli-${Date.now()}-${Math.random().toString(16).slice(2)}`);
     const statsPath = ledgerPath(`cli-shutdown-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
     const port = await allocatePort();
@@ -1137,6 +1151,9 @@ describe('HTTP server', () => {
 
     await withEnv({
       HOME: defaultHome,
+      // os.homedir() reads USERPROFILE on Windows — set both so the ~/ expansion
+      // resolves to the fake home at runtime cross-platform.
+      USERPROFILE: defaultHome,
       HEADROOM_LITE_STATS_PATH: '~/.headroom-lite/tilde-telemetry.json',
     }, async () => {
       const { startServer: startDefaultServer, resolveStatsPath } = await importFreshServerModule(defaultHome, tag);
@@ -1255,7 +1272,7 @@ describe('headroom-parity gap endpoints', () => {
     assert.deepEqual(await healthz.json(), await health.json());
   });
 
-  it('POST /stats/reset zeroes the runtime counters', async () => {
+  it('POST /stats/reset zeroes the runtime counters and telemetry session', async () => {
     await fetch(`${baseUrl}/v1/compress`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -1263,6 +1280,7 @@ describe('headroom-parity gap endpoints', () => {
     });
     const before = await (await fetch(`${baseUrl}/stats`)).json();
     assert.ok(before.compress_requests >= 1);
+    assert.ok(before.session.compression.requests >= 1);
 
     const reset = await fetch(`${baseUrl}/stats/reset`, { method: 'POST' });
     assert.equal(reset.status, 200);
@@ -1270,13 +1288,18 @@ describe('headroom-parity gap endpoints', () => {
     assert.equal(resetBody.compress_requests, 0);
     assert.equal(resetBody.compress_tokens_before, 0);
     assert.equal(resetBody.compress_tokens_after, 0);
+    // Telemetry session must reset too so /stats is internally consistent...
+    assert.equal(resetBody.session.compression.requests, 0);
+    // ...while durable lifetime history is preserved.
+    assert.ok(resetBody.lifetime.compression.requests >= 1);
 
     const after = await (await fetch(`${baseUrl}/stats`)).json();
     assert.equal(after.compress_requests, 0);
+    assert.equal(after.session.compression.requests, 0);
   });
 
   it('returns 501 not-implemented for known headroom endpoints hl does not serve', async () => {
-    const paths = ['/subscription-window', '/quota', '/admin/upstream', '/v1/telemetry', '/v1/toin/stats', '/cache/clear'];
+    const paths = ['/subscription-window', '/quota', '/v1/telemetry', '/v1/toin/stats', '/cache/clear', '/transformations/feed', '/dashboard'];
     for (const path of paths) {
       const r = await fetch(`${baseUrl}${path}`);
       assert.equal(r.status, 501, `${path} should be 501`);

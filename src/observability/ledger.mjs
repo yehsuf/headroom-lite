@@ -763,7 +763,7 @@ export function createTelemetryLedger({
     return snapshotToPrometheus(snapshotAt(new Date(now())));
   }
 
-  function flush() {
+  function commit(reset) {
     return withPersistenceLock(path, (renewLock) => {
       const capturedAt = new Date(now());
       const latest = loadAggregateState(path);
@@ -789,7 +789,15 @@ export function createTelemetryLedger({
         latestPrunedHistory.baselinePoint,
       );
       state.lifetime = mergedLifetime;
-      state.persistedSession = cloneAggregate(state.session);
+      if (reset) {
+        // Runtime reset: commit pending deltas above (no data loss), then zero
+        // the session so /stats, /metrics and the session aggregate return to 0
+        // while lifetime + durable history are preserved.
+        state.session = createAggregate();
+        state.persistedSession = createAggregate();
+      } else {
+        state.persistedSession = cloneAggregate(state.session);
+      }
       state.historyBaseline = prunedHistory.baselinePoint;
       state.historyPoints = prunedHistory.points;
 
@@ -805,6 +813,14 @@ export function createTelemetryLedger({
     });
   }
 
+  function flush() {
+    return commit(false);
+  }
+
+  function resetSession() {
+    return commit(true);
+  }
+
   return {
     recordCompression,
     recordProxy,
@@ -815,6 +831,7 @@ export function createTelemetryLedger({
     toCsv,
     toPrometheus,
     flush,
+    resetSession,
   };
 }
 
@@ -887,6 +904,15 @@ export function createInMemoryTelemetryLedger({
     return snapshotAt(capturedAt);
   }
 
+  function resetSession() {
+    // Snapshot current lifetime into history (parity with flush), then zero the
+    // runtime session; lifetime is updated live so it is preserved.
+    flush();
+    state.session = createAggregate();
+    state.persistedSession = createAggregate();
+    return snapshotAt(new Date(now()));
+  }
+
   return {
     recordCompression,
     recordProxy,
@@ -897,5 +923,6 @@ export function createInMemoryTelemetryLedger({
     toCsv,
     toPrometheus,
     flush,
+    resetSession,
   };
 }

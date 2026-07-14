@@ -79,8 +79,6 @@ const NOT_IMPLEMENTED_EXACT = {
   '/cache/clear': 'headroom-lite keeps no server-side cache to clear',
 };
 const NOT_IMPLEMENTED_PREFIXES = {
-  '/admin': 'headroom-lite exposes no admin API',
-  '/debug': 'headroom-lite exposes no debug API',
   '/v1/retrieve': 'headroom-lite has no RAG retrieval store',
   '/v1/feedback': 'headroom-lite collects no tool feedback',
   '/v1/telemetry': 'headroom-lite exposes telemetry via /stats, /stats-history and /metrics',
@@ -742,7 +740,11 @@ async function routeRequest(request, response, options) {
 
   if (method === 'POST' && url.pathname === '/stats/reset') {
     resetLegacyStatsState(options.statsState);
-    writeJson(response, 200, getStats(options.statsState));
+    options.telemetryLedger?.resetSession?.();
+    writeJson(response, 200, {
+      ...getStats(options.statsState),
+      ...getTelemetrySnapshot(options.telemetryLedger, options.statsState),
+    });
     return;
   }
 
