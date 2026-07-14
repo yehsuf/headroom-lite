@@ -544,6 +544,35 @@ export function resolveMaxBodyBytes(input = process.env.HEADROOM_LITE_MAX_BODY_B
 
 async function handleCompress(request, response, { maxBodyBytes, compressLive, lossyConfig, telemetryLedger, telemetryState, statsState }) {
   const startedAt = Date.now();
+  const telemetryEvent = {
+    tokensBefore: 0,
+    tokensAfter: 0,
+    provider: undefined,
+    model: undefined,
+  };
+  response.once('finish', () => {
+    let outcome = 'ok';
+    if ((response.statusCode ?? 0) >= 500) outcome = 'error';
+    else if ((response.statusCode ?? 0) >= 400) outcome = 'rejected';
+    const latencyMs = Date.now() - startedAt;
+    const tokensSaved = Math.max(0, telemetryEvent.tokensBefore - telemetryEvent.tokensAfter);
+    persistTelemetry(telemetryLedger, telemetryState, () => {
+      telemetryLedger.recordCompression?.({
+        tokensBefore: telemetryEvent.tokensBefore,
+        tokensAfter: telemetryEvent.tokensAfter,
+        latencyMs,
+        outcome,
+        provider: telemetryEvent.provider,
+        model: telemetryEvent.model,
+      });
+    }, [
+      ['compression.requests', 1],
+      ['compression.tokens_before', telemetryEvent.tokensBefore],
+      ['compression.tokens_after', telemetryEvent.tokensAfter],
+      ['compression.tokens_saved', tokensSaved],
+      ['compression.latency_ms', latencyMs],
+    ]);
+  });
   const rawBody = await readRequestBody(request, maxBodyBytes);
 
   let payload;
@@ -592,25 +621,11 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
     // injecting here would emit an incomplete key. Explicit cache-key support for
     // Responses is a separate feature; the sidecar caller does not consume the key.
 
+    telemetryEvent.tokensBefore = r.tokensBefore;
+    telemetryEvent.tokensAfter = r.tokensAfter;
+    telemetryEvent.provider = 'openai';
+    telemetryEvent.model = typeof payload.model === 'string' ? payload.model : undefined;
     writeJson(response, 200, responseBody);
-    const latencyMs = Date.now() - startedAt;
-    const tokensSaved = Math.max(0, r.tokensBefore - r.tokensAfter);
-    persistTelemetry(telemetryLedger, telemetryState, () => {
-      telemetryLedger.recordCompression?.({
-        tokensBefore: r.tokensBefore,
-        tokensAfter: r.tokensAfter,
-        latencyMs,
-        outcome: 'ok',
-        provider: 'openai',
-        model: typeof payload.model === 'string' ? payload.model : undefined,
-      });
-    }, [
-      ['compression.requests', 1],
-      ['compression.tokens_before', r.tokensBefore],
-      ['compression.tokens_after', r.tokensAfter],
-      ['compression.tokens_saved', tokensSaved],
-      ['compression.latency_ms', latencyMs],
-    ]);
     return;
   }
 
@@ -662,25 +677,11 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
     responseBody.cache_drift = driftInfo;
   }
 
+  telemetryEvent.tokensBefore = tokensBefore;
+  telemetryEvent.tokensAfter = tokensAfter;
+  telemetryEvent.provider = payload.format === 'openai' ? 'openai' : 'anthropic';
+  telemetryEvent.model = typeof payload.model === 'string' ? payload.model : undefined;
   writeJson(response, 200, responseBody);
-  const latencyMs = Date.now() - startedAt;
-  const tokensSaved = Math.max(0, tokensBefore - tokensAfter);
-  persistTelemetry(telemetryLedger, telemetryState, () => {
-    telemetryLedger.recordCompression?.({
-      tokensBefore,
-      tokensAfter,
-      latencyMs,
-      outcome: 'ok',
-      provider: payload.format === 'openai' ? 'openai' : 'anthropic',
-      model: typeof payload.model === 'string' ? payload.model : undefined,
-    });
-  }, [
-    ['compression.requests', 1],
-    ['compression.tokens_before', tokensBefore],
-    ['compression.tokens_after', tokensAfter],
-    ['compression.tokens_saved', tokensSaved],
-    ['compression.latency_ms', latencyMs],
-  ]);
 }
 
 async function routeRequest(request, response, options) {
