@@ -741,6 +741,10 @@ async function routeRequest(request, response, options) {
   if (method === 'POST' && url.pathname === '/stats/reset') {
     resetLegacyStatsState(options.statsState);
     options.telemetryLedger?.resetSession?.();
+    // resetSession() committed the pending session delta into durable history;
+    // drop the server's pending-rows buffer too so /stats-history doesn't count
+    // the same delta twice (mirrors flushTelemetry()).
+    options.telemetryState?.pendingRows?.clear();
     writeJson(response, 200, {
       ...getStats(options.statsState),
       ...getTelemetrySnapshot(options.telemetryLedger, options.statsState),

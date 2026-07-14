@@ -1298,6 +1298,30 @@ describe('headroom-parity gap endpoints', () => {
     assert.equal(after.session.compression.requests, 0);
   });
 
+  it('does not double-count history after POST /stats/reset', async () => {
+    await fetch(`${baseUrl}/v1/compress`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'y'.repeat(4000) }] }),
+    });
+    const sumRequests = (rows) => rows
+      .filter((r) => r.series === 'compression.requests')
+      .reduce((sum, r) => sum + r.value, 0);
+
+    const beforeRows = (await (await fetch(`${baseUrl}/stats-history`)).json()).rows;
+    const beforeValue = sumRequests(beforeRows);
+    assert.ok(beforeValue >= 1);
+
+    await fetch(`${baseUrl}/stats/reset`, { method: 'POST' });
+
+    const afterRows = (await (await fetch(`${baseUrl}/stats-history`)).json()).rows;
+    const afterValue = sumRequests(afterRows);
+    // The reset commits the pending delta into durable history exactly once — it
+    // must NOT also leave the same delta in the server's pending-rows buffer
+    // (which would double-count on the next /stats-history read).
+    assert.equal(afterValue, beforeValue, 'reset double-counted pending history rows');
+  });
+
   it('returns 501 not-implemented for known headroom endpoints hl does not serve', async () => {
     const paths = ['/subscription-window', '/quota', '/v1/telemetry', '/v1/toin/stats', '/cache/clear', '/transformations/feed', '/dashboard'];
     for (const path of paths) {
