@@ -16,10 +16,19 @@
   - tool-output JSON compaction now detects whitespace-delimited JSON object sequences such as `{"a":1} {"b":2}`;
   - JSON array compaction accepts opt-in `auditSafe` / `protectedPatterns` options and fails closed when matching rows cannot be preserved verbatim.
 
+### Fixed
+
+- Hardened telemetry ledger locking so stale-lock takeover is atomic, owner-fenced, claim-cleaned, and lock release is owner-checked (Fixes #12).
+- Preserved pending telemetry deltas across failed persisted-state writes so the next flush retries them (Fixes #13).
+- Recorded `/v1/compress` telemetry for rejected/error responses via response-finish observation (Fixes #14).
+- Opened the temp ledger file read/write (`r+`) before `fsync` so durable writes succeed on Windows, whose `FlushFileBuffers` requires a write-capable handle.
+- Added temp-file `fsync` before atomic ledger-file rename plus best-effort parent-directory `fsync` after it (ported from headroom #1764).
+
 ### Not included
 
 - Upstream A7/Kompress lossy-after-fold work is intentionally excluded because it is ML-based and outside headroom-lite's deterministic, zero-ML core scope.
 - CJK-aware code symbol matching: skipped because headroom-lite has no deterministic code symbol/relevance extractor equivalent; the only code classifier is for the optional lossy path.
+- Skipped headroom #1817/#1665/#1800: headroom-lite already keeps ledger persistence off the compress hot path, and has no cache-read savings or cache-write premium ledger fields to persist/adjust.
 
 ## [0.1.0] - 2026-07-10
 
