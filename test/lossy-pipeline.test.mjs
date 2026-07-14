@@ -46,6 +46,34 @@ describe('compressMessagesAsync', () => {
     assert.deepEqual(asyncOut.lossy, { enabled: false });
   });
 
+  it('runs deterministic lossless compression before sending candidates to lossy compression', async () => {
+    const repeatedLog = Array.from(
+      { length: 12 },
+      () => '[INFO] repeated event payload for ordering test',
+    ).join('\n');
+    const messages = [
+      { role: 'user', content: repeatedLog },
+      { role: 'assistant', content: 'latest reply' },
+    ];
+    let requestedText = null;
+
+    installFetch(async (_url, init) => {
+      const body = JSON.parse(init.body);
+      requestedText = body.items[0]?.text;
+      return new Response(JSON.stringify({
+        items: body.items.map((item) => ({ id: item.id, text: item.text, compressed: false })),
+      }), { status: 200 });
+    });
+
+    await compressMessagesAsync(messages, {
+      format: 'openai',
+      lossy: { ...LOSSY_ENABLED, minChars: 10 },
+    });
+
+    assert.match(requestedText, /\.\.\. \(repeated 12 times\)/);
+    assert.doesNotMatch(requestedText, /(?:\[INFO\].*\n){11}\[INFO\]/);
+  });
+
   it('Anthropic: frozen messages remain byte-exact even when service compresses later ones', async () => {
     const frozenText = 'FROZEN cached preamble ' + longProse();
     const messages = [

@@ -4,7 +4,13 @@
 
 ### Changed
 
-- Align the package version with upstream Headroom 0.31.0 while preserving headroom-lite's independent, deterministic, zero-runtime-dependency behavior.
+- Accepted deterministic tool-output compaction whenever the candidate actually shrinks the input, matching upstream Headroom 0.31.0's `min_ratio = 1.0` acceptance gate instead of the previous 15% minimum savings floor.
+- Kept the existing lossless-first async dispatch invariant: headroom-lite runs deterministic/lossless compression before any optional lossy service call.
+- Switched verified lossless fold acceptance to the deterministic token estimator so folds that save tokens are kept even when they do not save characters.
+
+### Not included
+
+- Upstream A7/Kompress lossy-after-fold work is intentionally excluded because it is ML-based and outside headroom-lite's deterministic, zero-ML core scope.
 
 ## [0.1.0] - 2026-07-10
 

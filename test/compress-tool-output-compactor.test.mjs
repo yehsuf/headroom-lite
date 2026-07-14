@@ -88,12 +88,24 @@ describe('compactStringArray', () => {
     assert.ok(markerIdx < parsed.length - 1, 'marker should not be last');
   });
 
-  it('returns null if savings below threshold', () => {
-    // Small array just over MIN_ITEMS — may not achieve MIN_SAVINGS_RATIO
+  it('returns null if compaction does not shrink the output', () => {
+    // Small array just over MIN_ITEMS may not achieve a positive shrink.
     const arr = Array.from({ length: MIN_ITEMS + 1 }, (_, i) => `x${i}`);
     const result = compactStringArray(arr);
     // Acceptable: either null (no savings) or a valid compact JSON string
     if (result !== null) assert.doesNotThrow(() => JSON.parse(result));
+  });
+
+  it('accepts any positive shrink even when savings are below the old 15 percent floor', () => {
+    const arr = Array.from({ length: 16 }, (_, i) => `${'x'.repeat(16)}${i}`);
+    const original = JSON.stringify(arr);
+    const result = compactStringArray(arr);
+
+    assert.ok(result !== null, 'one-byte shrink should be accepted');
+    assert.ok(result.length < original.length, `${result.length} should be less than ${original.length}`);
+    assert.ok(result.length / original.length > 0.85, 'fixture must remain below the old 15 percent savings floor');
+    assert.deepEqual(JSON.parse(result).slice(0, 10), arr.slice(0, 10));
+    assert.deepEqual(JSON.parse(result).slice(-5), arr.slice(-5));
   });
 });
 
