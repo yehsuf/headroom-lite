@@ -1,6 +1,6 @@
 {
   "name": "@yehsuf/headroom-lite",
-  "version": "0.30.0-1",
+  "version": "0.30.0-2",
   "description": "Deterministic, zero-ML context compression proxy — infosec-safe Headroom replacement",
   "type": "module",
   "license": "MIT",
