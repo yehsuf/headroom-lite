@@ -142,6 +142,50 @@ describe('filterDiffNoise', () => {
     assert.equal(filterDiffNoise(WHITESPACE_HUNK_DIFF), WHITESPACE_HUNK_DIFF_FILTERED);
   });
 
+  it('normalizes hunk line endings and trailing whitespace before returning kept diffs', () => {
+    const noisyDiff = [
+      'diff --git a/src/example.js b/src/example.js\r',
+      'index 111..222 100644\r',
+      '--- a/src/example.js\r',
+      '+++ b/src/example.js\r',
+      '@@ -1,3 +1,3 @@\r',
+      ' const before = true;   \r',
+      '-const value = "old";   \r',
+      '+const value = "new";\t\r',
+      ' const after = true;  ',
+    ].join('\n');
+
+    const normalizedDiff = [
+      'diff --git a/src/example.js b/src/example.js',
+      'index 111..222 100644',
+      '--- a/src/example.js',
+      '+++ b/src/example.js',
+      '@@ -1,3 +1,3 @@',
+      ' const before = true;',
+      '-const value = "old";',
+      '+const value = "new";',
+      ' const after = true;',
+    ].join('\n');
+
+    assert.equal(filterDiffNoise(noisyDiff), normalizedDiff);
+  });
+
+  it('drops hunks that only change trailing whitespace on non-empty lines', () => {
+    const trailingWhitespaceOnlyDiff = [
+      'diff --git a/src/example.js b/src/example.js',
+      'index 111..222 100644',
+      '--- a/src/example.js',
+      '+++ b/src/example.js',
+      '@@ -1,3 +1,3 @@',
+      ' const before = true;',
+      '-const value = "same";   ',
+      '+const value = "same";',
+      ' const after = true;',
+    ].join('\n');
+
+    assert.equal(filterDiffNoise(trailingWhitespaceOnlyDiff), '');
+  });
+
   it('drops section entirely when all its hunks are whitespace-only', () => {
     const allWhitespaceDiff = [
       'diff --git a/src/blank.js b/src/blank.js',
