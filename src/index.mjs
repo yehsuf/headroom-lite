@@ -14,12 +14,33 @@ const port = typeof address === 'object' && address !== null ? address.port : 'u
 
 console.log(`[${name}] v${version} listening on http://${host}:${port}`);
 
-function shutdown(signal) {
-  server.close(() => {
-    console.log(`[headroom-lite] received ${signal}, shutting down`);
-    process.exit(0);
-  });
+let shuttingDown = false;
+
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  console.log(`[headroom-lite] received ${signal}, shutting down`);
+
+  let exitCode = 0;
+  try {
+    if (typeof server.closeAndFlushTelemetry === 'function') {
+      await server.closeAndFlushTelemetry();
+    } else {
+      await new Promise((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+  } catch {
+    exitCode = 1;
+  }
+
+  process.exit(exitCode);
 }
 
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => {
+  void shutdown('SIGINT');
+});
+process.on('SIGTERM', () => {
+  void shutdown('SIGTERM');
+});

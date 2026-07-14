@@ -103,11 +103,42 @@ Default bind:
 - host: `127.0.0.1`
 - port: `8790`
 
+Loopback-only is the default. Set `HEADROOM_LITE_HOST` explicitly if you need
+to bind anywhere else.
+
 Environment variables:
 
 - `HEADROOM_LITE_PORT` or `PORT` — listener port
 - `HEADROOM_LITE_HOST` — listener host (default `127.0.0.1`)
 - `HEADROOM_LITE_MAX_BODY_BYTES` — max accepted request body size in bytes (default `5242880`)
+- `HEADROOM_LITE_STATS_PATH` — durable local telemetry ledger path (default `~/.headroom-lite/telemetry.json`)
+- `HEADROOM_LITE_STATS_MAX_POINTS` — retained history point cap (default `720`; `0` disables retained points)
+- `HEADROOM_LITE_STATS_MAX_AGE_DAYS` — retained history age cap in days (default `30`; `0` disables retained history)
+
+### Local observability profile
+
+All observability data stays local to the machine running headroom-lite. The
+ledger stores aggregate counters and sanitized label totals only — never raw
+request bodies, auth headers, prompts, tool output, or provider responses.
+
+- Default retention: keep at most `720` retained history points and at most `30`
+  days of retained history, whichever limit is hit first.
+- Default durable path: `~/.headroom-lite/telemetry.json`
+- Read-only default-path fallback: if that default path cannot be created,
+  headroom-lite keeps serving `/health`, `/readyz`, `/stats`, `/stats-history`,
+  and `/metrics` from an in-memory ledger and reports
+  `capabilities.persistence: false`.
+
+Capability meanings:
+
+| Capability | Meaning |
+|---|---|
+| `snapshot` | Versioned aggregate snapshot fields are available on the JSON status endpoints. |
+| `history` | `GET /stats-history` is supported. |
+| `csv` | `GET /stats-history?format=csv` is supported. |
+| `prometheus` | `GET /metrics` is supported. |
+| `flush` | Hourly flush plus graceful-shutdown flush is enabled. |
+| `persistence` | The telemetry ledger is backed by a local JSON file instead of the in-memory fallback. |
 
 ### Provider routing
 
@@ -151,6 +182,17 @@ Any value other than `live` (including `safe`, `true`, or absent) uses the defau
 
 ## HTTP API
 
+| Endpoint | Purpose | Example |
+|---|---|---|
+| `POST /v1/compress` | Deterministic compression sidecar contract. | `curl -s http://127.0.0.1:8790/v1/compress -H 'content-type: application/json' -d '{"messages":[{"role":"user","content":"hi"}]}'` |
+| `GET /health` | Health snapshot plus routing/config summary. | `curl -s http://127.0.0.1:8790/health` |
+| `GET /readyz` | Readiness snapshot plus capability flags. | `curl -s http://127.0.0.1:8790/readyz` |
+| `GET /livez` | Process liveness check. | `curl -s http://127.0.0.1:8790/livez` |
+| `GET /stats` | Legacy flat counters plus versioned telemetry snapshot. | `curl -s http://127.0.0.1:8790/stats` |
+| `GET /stats-history` | Retained aggregate history as JSON or CSV. | `curl -s 'http://127.0.0.1:8790/stats-history?series=hourly&format=json'` |
+| `GET /metrics` | Prometheus exposition for the same local aggregates. | `curl -s http://127.0.0.1:8790/metrics` |
+| Provider proxy routes | Transparent passthrough to configured upstreams. | `curl -s http://127.0.0.1:8790/v1/messages -H 'content-type: application/json' -d '{...}'` |
+
 ### `POST /v1/compress`
 
 Request body:
@@ -188,13 +230,34 @@ curl -s http://127.0.0.1:8790/v1/compress \
   }'
 ```
 
-### `GET /health`
+### Status and observability endpoints
 
-Readiness-style JSON response. Includes `upstreams` map (all four slots) and `compress_live` flag.
-
-### `GET /livez`
-
-Liveness-style JSON response.
+- `GET /health`
+  - Returns `status`, `service`, `schema_version`, `mode`, `max_body_bytes`,
+    `compress_live`, the full `upstreams` map, `capabilities`, and `lossy`.
+  - Legacy compatibility: `upstream` is still returned for one migration window
+    alongside `upstreams`.
+- `GET /readyz`
+  - Returns `status: "ready"`, `service`, `schema_version`, and
+    `capabilities`.
+- `GET /livez`
+  - Returns `status: "alive"` and `service`.
+- `GET /stats`
+  - Returns the versioned telemetry snapshot plus the legacy flat fields
+    `uptime_seconds`, `proxy_requests`, `compress_requests`,
+    `compress_tokens_before`, `compress_tokens_after`,
+    `compress_tokens_saved`, and `compress_pct`.
+- `GET /stats-history`
+  - Accepts only `series` and `format` query parameters.
+  - `series` must be one of `history`, `hourly`, `daily`, `weekly`, or
+    `monthly` (`history` is an alias for the default hourly buckets).
+  - `format` must be `json` or `csv`.
+  - JSON responses include `schema_version`, `status`, `service`, `series`,
+    and `rows`.
+  - CSV responses use `series,bucket_start,value`.
+- `GET /metrics`
+  - Returns Prometheus text for the same aggregate-only counters and label
+    totals exposed by `/stats`.
 
 ## Lossy Compression (Optional)
 
