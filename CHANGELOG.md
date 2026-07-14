@@ -8,9 +8,18 @@
 - Kept the existing lossless-first async dispatch invariant: headroom-lite runs deterministic/lossless compression before any optional lossy service call.
 - Switched verified lossless fold acceptance to the deterministic token estimator so folds that save tokens are kept even when they do not save characters.
 
+### Added
+
+- Ported deterministic headroom v0.31.0 content-transform guards for headroom-lite:
+  - diff filtering now normalizes mixed line endings and trailing hunk whitespace before returning kept diff sections;
+  - JSON object-array compaction now passes ragged rows and nested object cells through instead of emitting misaligned or lossy CSV-schema output;
+  - tool-output JSON compaction now detects whitespace-delimited JSON object sequences such as `{"a":1} {"b":2}`;
+  - JSON array compaction accepts opt-in `auditSafe` / `protectedPatterns` options and fails closed when matching rows cannot be preserved verbatim.
+
 ### Not included
 
 - Upstream A7/Kompress lossy-after-fold work is intentionally excluded because it is ML-based and outside headroom-lite's deterministic, zero-ML core scope.
+- CJK-aware code symbol matching: skipped because headroom-lite has no deterministic code symbol/relevance extractor equivalent; the only code classifier is for the optional lossy path.
 
 ## [0.1.0] - 2026-07-10
 
