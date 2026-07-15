@@ -1,7 +1,8 @@
 import { strict as assert } from 'node:assert';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { after, beforeEach, describe, it } from 'node:test';
@@ -235,6 +236,75 @@ try {
 }
 `;
 
+const STALE_LOCK_CLAIM_CHILD = `
+import { createRequire, syncBuiltinESMExports } from 'node:module';
+import { pathToFileURL } from 'node:url';
+
+const [
+  ,
+  modulePath,
+  ledgerPath,
+  role,
+  claimReadyPath,
+  releaseClaimPath,
+  enteredPath,
+  releaseEnteredPath,
+  firstEnteredPath,
+] = process.argv;
+const require = createRequire(import.meta.url);
+const fs = require('node:fs');
+const originalReadFileSync = fs.readFileSync;
+const originalRenameSync = fs.renameSync;
+const originalRmSync = fs.rmSync;
+const lockPath = \`\${ledgerPath}.lock\`;
+
+const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const waitFor = (path) => {
+  while (!fs.existsSync(path)) sleep(10);
+};
+
+let claimReady = false;
+function beforeClaim() {
+  if (claimReady) return;
+  claimReady = true;
+  fs.writeFileSync(claimReadyPath, 'ready\\n', 'utf8');
+  waitFor(releaseClaimPath);
+  if (role === 'second') waitFor(firstEnteredPath);
+}
+
+fs.renameSync = function patchedRenameSync(from, to, ...args) {
+  const textFrom = typeof from === 'string' ? from : from?.toString?.();
+  if (textFrom === lockPath) beforeClaim();
+  return originalRenameSync.call(this, from, to, ...args);
+};
+
+fs.rmSync = function patchedRmSync(path, ...args) {
+  const textPath = typeof path === 'string' ? path : path?.toString?.();
+  if (textPath === lockPath) beforeClaim();
+  return originalRmSync.call(this, path, ...args);
+};
+
+let entered = false;
+fs.readFileSync = function patchedReadFileSync(path, ...args) {
+  const textPath = typeof path === 'string' ? path : path?.toString?.();
+  if (!entered && textPath === ledgerPath) {
+    entered = true;
+    fs.writeFileSync(enteredPath, 'entered\\n', 'utf8');
+    waitFor(releaseEnteredPath);
+  }
+  return originalReadFileSync(path, ...args);
+};
+syncBuiltinESMExports();
+
+try {
+  const { createTelemetryLedger } = await import(pathToFileURL(modulePath).href);
+  createTelemetryLedger({ path: ledgerPath });
+} catch (error) {
+  console.error(error?.stack ?? error);
+  process.exitCode = 1;
+}
+`;
+
 async function waitForChildExit(child) {
   if (child.exitCode !== null || child.signalCode !== null) {
     assert.equal(child.signalCode, null);
@@ -395,6 +465,217 @@ describe('telemetry ledger', () => {
     assert.equal(snapshot.session.compression.requests, 0);
     assert.equal(snapshot.session.proxy.requests, 0);
     assert.equal(snapshot.history.retained_points, 1);
+  });
+
+  it('retains pending session deltas when a persist attempt fails', () => {
+    const path = ledgerPath('failed-flush-retry.json');
+    const ledger = createTelemetryLedger({ path });
+    ledger.recordCompression({
+      tokensBefore: 100,
+      tokensAfter: 40,
+      latencyMs: 12,
+      outcome: 'ok',
+      provider: 'anthropic',
+      model: 'claude-sonnet-4.5',
+    });
+
+    const require = createRequire(import.meta.url);
+    const fs = require('node:fs');
+    const originalRenameSync = fs.renameSync;
+    let failedOnce = false;
+    fs.renameSync = function patchedRenameSync(from, to, ...args) {
+      const textTo = typeof to === 'string' ? to : to?.toString?.();
+      if (!failedOnce && textTo === path) {
+        failedOnce = true;
+        throw new Error('simulated persisted-state rename failure');
+      }
+      return originalRenameSync.call(this, from, to, ...args);
+    };
+    syncBuiltinESMExports();
+
+    try {
+      assert.throws(() => ledger.flush(), /simulated persisted-state rename failure/);
+    } finally {
+      fs.renameSync = originalRenameSync;
+      syncBuiltinESMExports();
+    }
+
+    ledger.flush();
+    const persisted = JSON.parse(readFileSync(path, 'utf8'));
+    assert.equal(persisted.lifetime.compression.requests, 1);
+    assert.equal(persisted.lifetime.compression.tokens_saved, 60);
+    assert.equal(persisted.session.compression.requests, 1);
+    assert.equal(persisted.history_points.at(-1).compression.requests, 1);
+  });
+
+  it('does not overwrite a ledger after its persistence lock is reclaimed', () => {
+    const path = writePersistedLedger('lost-lock-before-write.json', createEmptyPersistedLedgerPayload());
+    const externalPayload = createEmptyPersistedLedgerPayload('2026-01-01T00:05:00.000Z');
+    externalPayload.lifetime.compression.requests = 10;
+    externalPayload.lifetime.compression.tokens_before = 1_000;
+    externalPayload.lifetime.compression.tokens_after = 900;
+    externalPayload.lifetime.compression.tokens_saved = 100;
+    externalPayload.history_points = [{
+      captured_at: '2026-01-01T00:05:00.000Z',
+      compression: {
+        requests: 10,
+        tokens_before: 1_000,
+        tokens_after: 900,
+        tokens_saved: 100,
+        latency_ms: 0,
+      },
+      proxy: { requests: 0, latency_ms: 0 },
+    }];
+    const ledger = createTelemetryLedger({ path });
+    ledger.recordCompression({ tokensBefore: 100, tokensAfter: 80, latencyMs: 3 });
+
+    const require = createRequire(import.meta.url);
+    const fs = require('node:fs');
+    const originalReadFileSync = fs.readFileSync;
+    let stoleLock = false;
+    fs.readFileSync = function patchedReadFileSync(targetPath, ...args) {
+      const textPath = typeof targetPath === 'string' ? targetPath : targetPath?.toString?.();
+      const content = originalReadFileSync.call(this, targetPath, ...args);
+      if (!stoleLock && textPath === path) {
+        stoleLock = true;
+        writeFileSync(join(`${path}.lock`, 'owner.json'), JSON.stringify({
+          pid: process.pid,
+          token: 'other-owner-token',
+          acquired_at: '2026-01-01T00:05:00.000Z',
+        }), 'utf8');
+        writeFileSync(join(`${path}.lock`, 'heartbeat'), `${Date.now()}\n`, 'utf8');
+        writeFileSync(path, JSON.stringify(externalPayload, null, 2), 'utf8');
+      }
+      return content;
+    };
+    syncBuiltinESMExports();
+
+    try {
+      assert.throws(() => ledger.flush(), /telemetry persistence lock lost/);
+    } finally {
+      fs.readFileSync = originalReadFileSync;
+      syncBuiltinESMExports();
+    }
+
+    const persisted = JSON.parse(readFileSync(path, 'utf8'));
+    assert.equal(persisted.lifetime.compression.requests, 10);
+    assert.equal(persisted.lifetime.compression.tokens_saved, 100);
+  });
+
+  it('fsyncs the ledger parent directory after atomically renaming persisted state', () => {
+    const path = ledgerPath('directory-fsync.json');
+    const ledger = createTelemetryLedger({ path });
+    ledger.recordCompression({ tokensBefore: 100, tokensAfter: 75, latencyMs: 8 });
+
+    const require = createRequire(import.meta.url);
+    const fs = require('node:fs');
+    const originalOpenSync = fs.openSync;
+    const originalFsyncSync = fs.fsyncSync;
+    const originalCloseSync = fs.closeSync;
+    const fakeDirFd = 867_5309;
+    let openedDirectory = false;
+    let fsyncedDirectory = false;
+    let closedDirectory = false;
+    fs.openSync = function patchedOpenSync(targetPath, flags, ...args) {
+      const textPath = typeof targetPath === 'string' ? targetPath : targetPath?.toString?.();
+      if (textPath === dirname(path) && flags === 'r') {
+        openedDirectory = true;
+        return fakeDirFd;
+      }
+      return originalOpenSync.call(this, targetPath, flags, ...args);
+    };
+    fs.fsyncSync = function patchedFsyncSync(fd) {
+      if (fd === fakeDirFd) {
+        fsyncedDirectory = true;
+        return;
+      }
+      return originalFsyncSync.call(this, fd);
+    };
+    fs.closeSync = function patchedCloseSync(fd) {
+      if (fd === fakeDirFd) {
+        closedDirectory = true;
+        return;
+      }
+      return originalCloseSync.call(this, fd);
+    };
+    syncBuiltinESMExports();
+
+    try {
+      ledger.flush();
+    } finally {
+      fs.openSync = originalOpenSync;
+      fs.fsyncSync = originalFsyncSync;
+      fs.closeSync = originalCloseSync;
+      syncBuiltinESMExports();
+    }
+
+    assert.equal(openedDirectory, true);
+    assert.equal(fsyncedDirectory, true);
+    assert.equal(closedDirectory, true);
+  });
+
+  it('fsyncs the temporary ledger file before the atomic rename', () => {
+    const path = ledgerPath('temporary-file-fsync.json');
+    const ledger = createTelemetryLedger({ path });
+    ledger.recordCompression({ tokensBefore: 100, tokensAfter: 70, latencyMs: 8 });
+
+    const require = createRequire(import.meta.url);
+    const fs = require('node:fs');
+    const originalOpenSync = fs.openSync;
+    const originalFsyncSync = fs.fsyncSync;
+    const originalCloseSync = fs.closeSync;
+    const originalRenameSync = fs.renameSync;
+    const fakeTempFd = 2_468_010;
+    let openedTempBeforeRename = false;
+    let fsyncedTempBeforeRename = false;
+    let closedTemp = false;
+    let renameHappened = false;
+    fs.openSync = function patchedOpenSync(targetPath, flags, ...args) {
+      const textPath = typeof targetPath === 'string' ? targetPath : targetPath?.toString?.();
+      if (textPath?.startsWith(`${path}.tmp-`) && flags === 'r+') {
+        assert.equal(renameHappened, false);
+        openedTempBeforeRename = true;
+        return fakeTempFd;
+      }
+      return originalOpenSync.call(this, targetPath, flags, ...args);
+    };
+    fs.fsyncSync = function patchedFsyncSync(fd) {
+      if (fd === fakeTempFd) {
+        assert.equal(renameHappened, false);
+        fsyncedTempBeforeRename = true;
+        return;
+      }
+      return originalFsyncSync.call(this, fd);
+    };
+    fs.closeSync = function patchedCloseSync(fd) {
+      if (fd === fakeTempFd) {
+        closedTemp = true;
+        return;
+      }
+      return originalCloseSync.call(this, fd);
+    };
+    fs.renameSync = function patchedRenameSync(from, to, ...args) {
+      const textTo = typeof to === 'string' ? to : to?.toString?.();
+      if (textTo === path) {
+        renameHappened = true;
+      }
+      return originalRenameSync.call(this, from, to, ...args);
+    };
+    syncBuiltinESMExports();
+
+    try {
+      ledger.flush();
+    } finally {
+      fs.openSync = originalOpenSync;
+      fs.fsyncSync = originalFsyncSync;
+      fs.closeSync = originalCloseSync;
+      fs.renameSync = originalRenameSync;
+      syncBuiltinESMExports();
+    }
+
+    assert.equal(openedTempBeforeRename, true);
+    assert.equal(fsyncedTempBeforeRename, true);
+    assert.equal(closedTemp, true);
   });
 
   it('rewrites stale session totals to zero on startup before any new event is recorded', () => {
@@ -674,6 +955,147 @@ describe('telemetry ledger', () => {
     const persisted = JSON.parse(readFileSync(path, 'utf8'));
     assert.equal(persisted.lifetime.compression.requests, 2);
     assert.equal(persisted.lifetime.compression.tokens_saved, 110);
+  });
+
+  it('allows only one contender to take over the same stale lock', async () => {
+    const path = writePersistedLedger('stale-lock-takeover.json', createEmptyPersistedLedgerPayload());
+    const lockPath = `${path}.lock`;
+    mkdirSync(lockPath, { recursive: true });
+    writeFileSync(join(lockPath, 'owner.json'), JSON.stringify({
+      pid: 9_999_999,
+      token: 'stale-owner',
+      acquired_at: '2026-01-01T00:00:00.000Z',
+    }), 'utf8');
+    writeFileSync(join(lockPath, 'heartbeat'), '0\n', 'utf8');
+    const oldDate = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, oldDate, oldDate);
+    utimesSync(join(lockPath, 'heartbeat'), oldDate, oldDate);
+
+    const releaseClaimPath = ledgerPath('stale-lock.release-claim');
+    const firstReadyPath = ledgerPath('stale-lock.first.ready');
+    const secondReadyPath = ledgerPath('stale-lock.second.ready');
+    const firstEnteredPath = ledgerPath('stale-lock.first.entered');
+    const secondEnteredPath = ledgerPath('stale-lock.second.entered');
+    const firstReleasePath = ledgerPath('stale-lock.first.release');
+    const secondReleasePath = ledgerPath('stale-lock.second.release');
+    const childArgs = [
+      '--input-type=module',
+      '-e',
+      STALE_LOCK_CLAIM_CHILD,
+      LEDGER_MODULE_PATH,
+      path,
+    ];
+    const firstChild = spawn(process.execPath, [
+      ...childArgs,
+      'first',
+      firstReadyPath,
+      releaseClaimPath,
+      firstEnteredPath,
+      firstReleasePath,
+      firstEnteredPath,
+    ], { stdio: ['ignore', 'ignore', 'inherit'] });
+    const secondChild = spawn(process.execPath, [
+      ...childArgs,
+      'second',
+      secondReadyPath,
+      releaseClaimPath,
+      secondEnteredPath,
+      secondReleasePath,
+      firstEnteredPath,
+    ], { stdio: ['ignore', 'ignore', 'inherit'] });
+
+    try {
+      await Promise.all([waitForPath(firstReadyPath), waitForPath(secondReadyPath)]);
+      writeFileSync(releaseClaimPath, 'release\n', 'utf8');
+      await waitForPath(firstEnteredPath);
+
+      assert.equal(await waitForPathWithTimeout(secondEnteredPath, 300), false);
+
+      writeFileSync(firstReleasePath, 'release\n', 'utf8');
+      await waitForPath(secondEnteredPath);
+    } finally {
+      for (const releasePath of [releaseClaimPath, firstReleasePath, secondReleasePath]) {
+        if (!existsSync(releasePath)) writeFileSync(releasePath, 'release\n', 'utf8');
+      }
+      await Promise.allSettled([
+        waitForChildExitWithTimeout(firstChild),
+        waitForChildExitWithTimeout(secondChild),
+      ]);
+    }
+  });
+
+  it('cleans up a temporary stale-lock claim when restore loses a race', () => {
+    const path = writePersistedLedger('stale-lock-claim-cleanup.json', createEmptyPersistedLedgerPayload());
+    const lockPath = `${path}.lock`;
+    mkdirSync(lockPath, { recursive: true });
+    writeFileSync(join(lockPath, 'owner.json'), JSON.stringify({
+      pid: 9_999_999,
+      token: 'stale-owner',
+      acquired_at: '2026-01-01T00:00:00.000Z',
+    }), 'utf8');
+    writeFileSync(join(lockPath, 'heartbeat'), '0\n', 'utf8');
+    const oldDate = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, oldDate, oldDate);
+    utimesSync(join(lockPath, 'heartbeat'), oldDate, oldDate);
+
+    const require = createRequire(import.meta.url);
+    const fs = require('node:fs');
+    const originalRenameSync = fs.renameSync;
+    const originalMkdirSync = fs.mkdirSync;
+    let swappedOnce = false;
+    let simulatedMkdirRace = false;
+    fs.renameSync = function patchedRenameSync(from, to, ...args) {
+      const textFrom = typeof from === 'string' ? from : from?.toString?.();
+      const textTo = typeof to === 'string' ? to : to?.toString?.();
+      if (!swappedOnce && textFrom === lockPath && textTo?.includes('.claim-')) {
+        swappedOnce = true;
+        rmSync(lockPath, { recursive: true, force: true });
+        mkdirSync(lockPath);
+        writeFileSync(join(lockPath, 'owner.json'), JSON.stringify({
+          pid: process.pid,
+          token: 'fresh-owner',
+          acquired_at: '2026-01-01T00:01:00.000Z',
+        }), 'utf8');
+        writeFileSync(join(lockPath, 'heartbeat'), `${Date.now()}\n`, 'utf8');
+        return originalRenameSync.call(this, from, to, ...args);
+      }
+      return originalRenameSync.call(this, from, to, ...args);
+    };
+    fs.mkdirSync = function patchedMkdirSync(targetPath, ...args) {
+      const textPath = typeof targetPath === 'string' ? targetPath : targetPath?.toString?.();
+      if (swappedOnce && !simulatedMkdirRace && textPath === lockPath) {
+        simulatedMkdirRace = true;
+        originalMkdirSync.call(this, targetPath, ...args);
+        writeFileSync(join(lockPath, 'owner.json'), JSON.stringify({
+          pid: 9_999_998,
+          token: 'other-stale-owner',
+          acquired_at: '2026-01-01T00:02:00.000Z',
+        }), 'utf8');
+        writeFileSync(join(lockPath, 'heartbeat'), '0\n', 'utf8');
+        utimesSync(lockPath, oldDate, oldDate);
+        utimesSync(join(lockPath, 'heartbeat'), oldDate, oldDate);
+        const error = new Error(`EEXIST: file already exists, mkdir '${textPath}'`);
+        error.code = 'EEXIST';
+        throw error;
+      }
+      return originalMkdirSync.call(this, targetPath, ...args);
+    };
+    syncBuiltinESMExports();
+
+    try {
+      const ledger = createTelemetryLedger({ path });
+      ledger.recordCompression({ tokensBefore: 10, tokensAfter: 8, latencyMs: 1 });
+      ledger.flush();
+    } finally {
+      fs.renameSync = originalRenameSync;
+      fs.mkdirSync = originalMkdirSync;
+      syncBuiltinESMExports();
+    }
+
+    assert.deepEqual(
+      readdirSync(dirname(path)).filter((entry) => entry.includes('.lock.claim-')),
+      [],
+    );
   });
 
   it('calculates hourly deltas from cumulative history points', () => {

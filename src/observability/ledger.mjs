@@ -1,5 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 const SCHEMA_VERSION = 1;
 const SERVICE = 'headroom-lite';
@@ -353,7 +354,11 @@ function readLockOwner(lockPath) {
   try {
     const parsed = JSON.parse(readFileSync(lockOwnerPath(lockPath), 'utf8'));
     if (Number.isInteger(parsed?.pid) && parsed.pid > 0) {
-      return { pid: parsed.pid };
+      return {
+        pid: parsed.pid,
+        token: typeof parsed.token === 'string' && parsed.token.length > 0 ? parsed.token : null,
+        acquiredAt: typeof parsed.acquired_at === 'string' ? parsed.acquired_at : null,
+      };
     }
   } catch {
     return null;
@@ -361,11 +366,26 @@ function readLockOwner(lockPath) {
   return null;
 }
 
-function writeLockOwner(lockPath) {
-  writeFileSync(lockOwnerPath(lockPath), JSON.stringify({
+function createLockOwner() {
+  return {
     pid: process.pid,
-    acquired_at: new Date().toISOString(),
+    token: randomUUID(),
+    acquiredAt: new Date().toISOString(),
+  };
+}
+
+function writeLockOwner(lockPath, owner) {
+  writeFileSync(lockOwnerPath(lockPath), JSON.stringify({
+    pid: owner.pid,
+    token: owner.token,
+    acquired_at: owner.acquiredAt,
   }), 'utf8');
+}
+
+function lockOwnersMatch(left, right) {
+  if (!left || !right) return false;
+  if (left.token && right.token) return left.token === right.token;
+  return left.pid === right.pid && left.acquiredAt === right.acquiredAt;
 }
 
 function renewLockHeartbeat(lockPath) {
@@ -400,21 +420,79 @@ function lockCanBeReclaimed(lockPath, staleMs) {
   return !owner || !processIsRunning(owner.pid);
 }
 
+function restoreClaimedLock(claimPath, lockPath) {
+  let restoredPath = false;
+  try {
+    mkdirSync(lockPath);
+    restoredPath = true;
+  } catch {
+    // Another contender already has the lock path; do not overwrite it.
+  }
+  if (restoredPath) {
+    try {
+      writeFileSync(lockOwnerPath(lockPath), readFileSync(lockOwnerPath(claimPath), 'utf8'), 'utf8');
+    } catch {
+      // The claimed directory may have been a fresh, ownerless lock that we
+      // raced with. Leave the empty lock path in place so that owner can finish
+      // acquiring instead of deleting a directory it just created.
+    }
+    try {
+      writeFileSync(lockHeartbeatPath(lockPath), readFileSync(lockHeartbeatPath(claimPath), 'utf8'), 'utf8');
+    } catch {
+      // Heartbeat can be renewed by the restored owner; owner token is the
+      // fencing value that matters for correctness.
+    }
+  }
+  try {
+    rmSync(claimPath, { recursive: true, force: true });
+  } catch {
+    // Best effort: a contender that raced with a fresh owner must not delete the
+    // current lock path; a leaked claim is preferable to corrupting the ledger.
+  }
+}
+
+function claimStaleLock(lockPath, staleMs) {
+  if (lockHeartbeatAgeMs(lockPath) < staleMs) return false;
+  const expectedOwner = readLockOwner(lockPath);
+  if (expectedOwner && processIsRunning(expectedOwner.pid)) return false;
+
+  const claimPath = `${lockPath}.claim-${process.pid}-${Date.now()}-${randomUUID()}`;
+  try {
+    renameSync(lockPath, claimPath);
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'EEXIST' || error?.code === 'ENOTEMPTY') return false;
+    throw error;
+  }
+
+  const claimedOwner = readLockOwner(claimPath);
+  const claimedExpectedLock = expectedOwner
+    ? lockOwnersMatch(claimedOwner, expectedOwner)
+    : claimedOwner === null;
+  if (!claimedExpectedLock || lockHeartbeatAgeMs(claimPath) < staleMs) {
+    restoreClaimedLock(claimPath, lockPath);
+    return false;
+  }
+
+  rmSync(claimPath, { recursive: true, force: true });
+  return true;
+}
+
 function withPersistenceLock(path, callback) {
   mkdirSync(dirname(path), { recursive: true });
   const lockPath = lockPathFor(path);
   const deadline = Date.now() + DEFAULT_PERSIST_LOCK_TIMEOUT_MS;
+  const lockOwner = createLockOwner();
 
   while (true) {
     try {
       mkdirSync(lockPath);
-      writeLockOwner(lockPath);
+      writeLockOwner(lockPath, lockOwner);
       renewLockHeartbeat(lockPath);
       break;
     } catch (error) {
       if (error?.code !== 'EEXIST') throw error;
-      if (lockCanBeReclaimed(lockPath, DEFAULT_PERSIST_LOCK_STALE_MS)) {
-        rmSync(lockPath, { recursive: true, force: true });
+      if (lockCanBeReclaimed(lockPath, DEFAULT_PERSIST_LOCK_STALE_MS)
+        && claimStaleLock(lockPath, DEFAULT_PERSIST_LOCK_STALE_MS)) {
         continue;
       }
       const remainingMs = deadline - Date.now();
@@ -425,27 +503,29 @@ function withPersistenceLock(path, callback) {
     }
   }
 
+  const renewOwnedLock = () => {
+    if (!lockOwnersMatch(readLockOwner(lockPath), lockOwner)) {
+      throw new Error(`telemetry persistence lock lost: ${path}`);
+    }
+    renewLockHeartbeat(lockPath);
+  };
+
   const heartbeatTimer = setInterval(() => {
     try {
-      renewLockHeartbeat(lockPath);
+      renewOwnedLock();
     } catch {
-      // Best-effort heartbeat updates; the owner PID check still prevents
-      // healthy holders from being reclaimed if the timer misses a beat.
+      // Best-effort heartbeat updates; explicit renewals fence writes.
     }
   }, DEFAULT_PERSIST_LOCK_HEARTBEAT_MS);
   heartbeatTimer.unref?.();
 
   try {
-    return callback(() => {
-      try {
-        renewLockHeartbeat(lockPath);
-      } catch {
-        // Best-effort manual renewals use the same safety model as the timer.
-      }
-    });
+    return callback(renewOwnedLock);
   } finally {
     clearInterval(heartbeatTimer);
-    rmSync(lockPath, { recursive: true, force: true });
+    if (lockOwnersMatch(readLockOwner(lockPath), lockOwner)) {
+      rmSync(lockPath, { recursive: true, force: true });
+    }
   }
 }
 
@@ -619,11 +699,50 @@ function createPersistedState({
   };
 }
 
+function fsyncParentDirectory(path) {
+  let directoryFd = null;
+  try {
+    directoryFd = openSync(dirname(path), 'r');
+    fsyncSync(directoryFd);
+  } catch {
+    // Directory fsync is a POSIX crash-durability optimization; some platforms
+    // and filesystems do not permit opening directories this way.
+  } finally {
+    if (directoryFd !== null) {
+      try {
+        closeSync(directoryFd);
+      } catch {
+        // Best effort only.
+      }
+    }
+  }
+}
+
+function fsyncFile(path) {
+  let fileFd = null;
+  try {
+    // Open read/write: Windows FlushFileBuffers requires a handle with write
+    // access, so a read-only ('r') descriptor makes fsyncSync fail there.
+    fileFd = openSync(path, 'r+');
+    fsyncSync(fileFd);
+  } finally {
+    if (fileFd !== null) {
+      try {
+        closeSync(fileFd);
+      } catch {
+        // Best effort only.
+      }
+    }
+  }
+}
+
 function writePersistedState(path, persistedState) {
   mkdirSync(dirname(path), { recursive: true });
   const tempPath = `${path}.tmp-${process.pid}-${Date.now()}`;
   writeFileSync(tempPath, JSON.stringify(persistedState, null, 2), 'utf8');
+  fsyncFile(tempPath);
   renameSync(tempPath, path);
+  fsyncParentDirectory(path);
 }
 
 function loadAggregateState(path) {
@@ -788,27 +907,24 @@ export function createTelemetryLedger({
         historyAgeLimitMs,
         latestPrunedHistory.baselinePoint,
       );
-      state.lifetime = mergedLifetime;
-      if (reset) {
-        // Runtime reset: commit pending deltas above (no data loss), then zero
-        // the session so /stats, /metrics and the session aggregate return to 0
-        // while lifetime + durable history are preserved.
-        state.session = createAggregate();
-        state.persistedSession = createAggregate();
-      } else {
-        state.persistedSession = cloneAggregate(state.session);
-      }
-      state.historyBaseline = prunedHistory.baselinePoint;
-      state.historyPoints = prunedHistory.points;
+      const nextSession = reset ? createAggregate() : cloneAggregate(state.session);
+      const nextPersistedSession = reset ? createAggregate() : cloneAggregate(state.session);
+      const nextHistoryBaseline = prunedHistory.baselinePoint;
+      const nextHistoryPoints = prunedHistory.points;
 
       renewLock();
       writePersistedState(path, createPersistedState({
         capturedAt,
-        lifetime: state.lifetime,
-        session: state.session,
-        historyBaseline: state.historyBaseline,
-        historyPoints: state.historyPoints,
+        lifetime: mergedLifetime,
+        session: nextSession,
+        historyBaseline: nextHistoryBaseline,
+        historyPoints: nextHistoryPoints,
       }));
+      state.lifetime = mergedLifetime;
+      state.session = nextSession;
+      state.persistedSession = nextPersistedSession;
+      state.historyBaseline = nextHistoryBaseline;
+      state.historyPoints = nextHistoryPoints;
       return snapshotAt(capturedAt);
     });
   }

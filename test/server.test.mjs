@@ -360,7 +360,7 @@ describe('HTTP server', () => {
     assert.ok(typeof body.compress_pct === 'string');
   });
 
-  it('records /v1/compress telemetry only after successful responses', async () => {
+  it('records /v1/compress telemetry for rejected and successful responses', async () => {
     const before = await (await fetch(`${baseUrl}/stats`)).json();
     const invalid = await fetch(`${baseUrl}/v1/compress`, {
       method: 'POST',
@@ -370,7 +370,8 @@ describe('HTTP server', () => {
     assert.equal(invalid.status, 400);
     const afterInvalid = await (await fetch(`${baseUrl}/stats`)).json();
     assert.equal(afterInvalid.compress_requests, before.compress_requests);
-    assert.equal(afterInvalid.session.compression.requests, before.session.compression.requests);
+    assert.equal(afterInvalid.session.compression.requests, before.session.compression.requests + 1);
+    assert.equal(afterInvalid.session.compression.outcomes.rejected, (before.session.compression.outcomes.rejected ?? 0) + 1);
 
     await fetch(`${baseUrl}/v1/compress`, {
       method: 'POST',
@@ -379,9 +380,10 @@ describe('HTTP server', () => {
     });
     const afterSuccess = await (await fetch(`${baseUrl}/stats`)).json();
     assert.equal(afterSuccess.compress_requests, before.compress_requests + 1);
-    assert.equal(afterSuccess.session.compression.requests, before.session.compression.requests + 1);
+    assert.equal(afterSuccess.session.compression.requests, before.session.compression.requests + 2);
+    assert.equal(afterSuccess.session.compression.outcomes.ok, (before.session.compression.outcomes.ok ?? 0) + 1);
     const history = await (await fetch(`${baseUrl}/stats-history?series=hourly`)).json();
-    assert.ok(history.rows.some((row) => row.series === 'compression.requests' && row.value >= 1));
+    assert.ok(history.rows.some((row) => row.series === 'compression.requests' && row.value >= 2));
   });
 
   it('coalesces persisted and pending hourly history rows into one canonical row', async () => {
