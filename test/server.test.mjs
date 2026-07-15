@@ -386,6 +386,38 @@ describe('HTTP server', () => {
     assert.ok(history.rows.some((row) => row.series === 'compression.requests' && row.value >= 2));
   });
 
+  it('self-identifies as headroom-lite via response header and compress body', async () => {
+    // Header on every first-class endpoint (health + compress).
+    const health = await fetch(`${baseUrl}/health`);
+    assert.equal(health.headers.get('x-headroom-implementation'), 'headroom-lite');
+    const metrics = await fetch(`${baseUrl}/metrics`);
+    assert.equal(metrics.headers.get('x-headroom-implementation'), 'headroom-lite');
+
+    // Messages path: header + body `service` field.
+    const msg = await fetch(`${baseUrl}/v1/compress`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi hi' }] }),
+    });
+    assert.equal(msg.status, 200);
+    assert.equal(msg.headers.get('x-headroom-implementation'), 'headroom-lite');
+    const msgBody = await msg.json();
+    assert.equal(msgBody.service, 'headroom-lite');
+    assert.ok(Array.isArray(msgBody.messages));
+
+    // Responses API path: header + body `service` field.
+    const resp = await fetch(`${baseUrl}/v1/compress`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ kind: 'responses', input: [{ role: 'user', content: 'hi hi' }] }),
+    });
+    assert.equal(resp.status, 200);
+    assert.equal(resp.headers.get('x-headroom-implementation'), 'headroom-lite');
+    const respBody = await resp.json();
+    assert.equal(respBody.service, 'headroom-lite');
+    assert.ok(Array.isArray(respBody.input));
+  });
+
   it('coalesces persisted and pending hourly history rows into one canonical row', async () => {
     const clock = createClock('2026-01-01T00:05:00.000Z');
     const coalescedLedger = createTelemetryLedger({
@@ -533,6 +565,7 @@ describe('HTTP server', () => {
 
     assert.equal(response.status, 200);
     assert.deepEqual(body, {
+      service: 'headroom-lite',
       messages: expected.messages,
       tokens_before: expected.tokensBefore,
       tokens_after: expected.tokensAfter,

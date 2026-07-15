@@ -15,6 +15,11 @@ import { resolveUpstreams, selectUpstream } from './providers/upstreams.mjs';
 import { createInMemoryTelemetryLedger, createTelemetryLedger } from './observability/ledger.mjs';
 
 const driftDetector = new DriftDetector();
+// Self-identification so any consumer (proxy, health check, or /v1/compress
+// caller) can distinguish this deterministic reimplementation from upstream
+// classic headroom, on every HTTP response (header) and in the compress body.
+const IMPLEMENTATION_NAME = 'headroom-lite';
+const IMPLEMENTATION_HEADER = 'x-headroom-implementation';
 const TELEMETRY_SCHEMA_VERSION = 1;
 const TELEMETRY_CAPABILITIES = Object.freeze({
   snapshot: true,
@@ -179,6 +184,7 @@ function writeText(response, statusCode, body, contentType) {
   response.writeHead(statusCode, {
     'content-type': contentType,
     'content-length': Buffer.byteLength(body).toString(),
+    [IMPLEMENTATION_HEADER]: IMPLEMENTATION_NAME,
   });
   response.end(body);
 }
@@ -515,6 +521,7 @@ function writeJson(response, statusCode, payload) {
   response.writeHead(statusCode, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(body).toString(),
+    [IMPLEMENTATION_HEADER]: IMPLEMENTATION_NAME,
   });
   response.end(body);
 }
@@ -605,6 +612,7 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
     statsState.compressTokensAfter += r.tokensAfter;
 
     const responseBody = {
+      service: IMPLEMENTATION_NAME,
       input: r.items,
       tokens_before: r.tokensBefore,
       tokens_after: r.tokensAfter,
@@ -649,6 +657,7 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
   const warnings = detectVolatileContent({ messages: payload.messages, frozenCount, system });
 
   const responseBody = {
+    service: IMPLEMENTATION_NAME,
     messages,
     tokens_before: tokensBefore,
     tokens_after: tokensAfter,
