@@ -8,6 +8,7 @@ import { normalizeTools } from './normalize/tools.mjs';
 import { detectVolatileContent } from './analyze/volatile-detector.mjs';
 import { proxyRequest, proxyCompressedRequest, resolveUpstream, resolveProxyTimeoutMs, resolveCompressProxy, resolveCompressLive } from './proxy.mjs';
 import { parseIntOption } from './lib/config.mjs';
+import { IMPLEMENTATION_NAME, IMPLEMENTATION_HEADER } from './lib/identity.mjs';
 import { DriftDetector } from './analyze/drift-detector.mjs';
 import { injectOpenAICacheKey, resolveOpenAICacheKey } from './normalize/openai-cache-key.mjs';
 import { detectProvider } from './providers/detect.mjs';
@@ -179,6 +180,7 @@ function writeText(response, statusCode, body, contentType) {
   response.writeHead(statusCode, {
     'content-type': contentType,
     'content-length': Buffer.byteLength(body).toString(),
+    [IMPLEMENTATION_HEADER]: IMPLEMENTATION_NAME,
   });
   response.end(body);
 }
@@ -515,6 +517,7 @@ function writeJson(response, statusCode, payload) {
   response.writeHead(statusCode, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(body).toString(),
+    [IMPLEMENTATION_HEADER]: IMPLEMENTATION_NAME,
   });
   response.end(body);
 }
@@ -605,6 +608,7 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
     statsState.compressTokensAfter += r.tokensAfter;
 
     const responseBody = {
+      service: IMPLEMENTATION_NAME,
       input: r.items,
       tokens_before: r.tokensBefore,
       tokens_after: r.tokensAfter,
@@ -649,6 +653,7 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
   const warnings = detectVolatileContent({ messages: payload.messages, frozenCount, system });
 
   const responseBody = {
+    service: IMPLEMENTATION_NAME,
     messages,
     tokens_before: tokensBefore,
     tokens_after: tokensAfter,
@@ -830,6 +835,7 @@ async function routeRequest(request, response, options) {
             response.writeHead(502, {
               'content-type': 'application/json; charset=utf-8',
               'content-length': String(Buffer.byteLength(msg)),
+              [IMPLEMENTATION_HEADER]: IMPLEMENTATION_NAME,
             });
             response.end(msg);
           } catch { /* socket already gone */ }

@@ -14,6 +14,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { parseIntOption } from './lib/config.mjs';
+import { IMPLEMENTATION_NAME, IMPLEMENTATION_HEADER } from './lib/identity.mjs';
 import { compressMessages } from './compress/pipeline.mjs';
 import { detectFormat } from './providers/detect.mjs';
 
@@ -200,6 +201,7 @@ export function proxyRequest(inboundReq, inboundRes, { upstream, timeoutMs = DEF
       inboundRes.writeHead(statusCode, {
         'content-type': 'application/json; charset=utf-8',
         'content-length': Buffer.byteLength(errorBody).toString(),
+        [IMPLEMENTATION_HEADER]: IMPLEMENTATION_NAME,
       });
       inboundRes.end(errorBody);
     } catch {
@@ -245,6 +247,7 @@ export async function proxyCompressedRequest(inboundReq, inboundRes, {
         inboundRes.writeHead(502, {
           'content-type': 'application/json; charset=utf-8',
           'content-length': String(Buffer.byteLength(msg)),
+          [IMPLEMENTATION_HEADER]: IMPLEMENTATION_NAME,
         });
         inboundRes.end(msg);
       } catch { /* socket already gone */ }

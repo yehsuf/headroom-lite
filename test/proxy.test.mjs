@@ -193,6 +193,20 @@ describe('auth header forwarding invariant', () => {
     assert.strictEqual(receivedHeaders['authorization'], token);
   });
 
+  it('does NOT stamp the headroom-lite header onto a forwarded upstream response', async () => {
+    const res = await request({
+      host: '127.0.0.1',
+      port: proxyPort,
+      path: '/v1/messages',
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    }, '{}');
+    assert.strictEqual(res.status, 200);
+    // Upstream passthrough must remain opaque — our identity header belongs only
+    // to responses headroom-lite generates itself.
+    assert.strictEqual(res.headers['x-headroom-implementation'], undefined);
+  });
+
   it('forwards x-api-key header byte-for-byte', async () => {
     const apiKey = 'sk-ant-api-XAPIKEY99999';
     await request({
@@ -462,6 +476,8 @@ describe('upstream error handling', () => {
   it('returns 502 when upstream connection is refused', async () => {
     const res = await request({ host: '127.0.0.1', port: proxyPort, path: '/v1/messages', method: 'POST' }, '{}');
     assert.strictEqual(res.status, 502);
+    // Self-generated gateway errors identify as headroom-lite (not upstream passthrough).
+    assert.strictEqual(res.headers['x-headroom-implementation'], 'headroom-lite');
     const body = JSON.parse(res.body);
     assert.ok(typeof body.error === 'string');
   });
