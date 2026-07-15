@@ -721,7 +721,9 @@ function fsyncParentDirectory(path) {
 function fsyncFile(path) {
   let fileFd = null;
   try {
-    fileFd = openSync(path, 'r');
+    // Open read/write: Windows FlushFileBuffers requires a handle with write
+    // access, so a read-only ('r') descriptor makes fsyncSync fail there.
+    fileFd = openSync(path, 'r+');
     fsyncSync(fileFd);
   } finally {
     if (fileFd !== null) {

@@ -632,7 +632,7 @@ describe('telemetry ledger', () => {
     let renameHappened = false;
     fs.openSync = function patchedOpenSync(targetPath, flags, ...args) {
       const textPath = typeof targetPath === 'string' ? targetPath : targetPath?.toString?.();
-      if (textPath?.startsWith(`${path}.tmp-`) && flags === 'r') {
+      if (textPath?.startsWith(`${path}.tmp-`) && flags === 'r+') {
         assert.equal(renameHappened, false);
         openedTempBeforeRename = true;
         return fakeTempFd;
