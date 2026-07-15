@@ -10,6 +10,7 @@
 
 ### Added
 
+- All HTTP responses now carry `x-headroom-implementation: headroom-lite` so callers can distinguish headroom-lite from upstream headroom at the protocol level. The `/v1/compress` response body also includes a `"service": "headroom-lite"` field. Upstream passthrough responses are byte-piped and left unstamped.
 - Ported deterministic headroom v0.31.0 content-transform guards for headroom-lite:
   - diff filtering now normalizes mixed line endings and trailing hunk whitespace before returning kept diff sections;
   - JSON object-array compaction now passes ragged rows and nested object cells through instead of emitting misaligned or lossy CSV-schema output;
