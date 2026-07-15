@@ -8,6 +8,7 @@ import { normalizeTools } from './normalize/tools.mjs';
 import { detectVolatileContent } from './analyze/volatile-detector.mjs';
 import { proxyRequest, proxyCompressedRequest, resolveUpstream, resolveProxyTimeoutMs, resolveCompressProxy, resolveCompressLive } from './proxy.mjs';
 import { parseIntOption } from './lib/config.mjs';
+import { IMPLEMENTATION_NAME, IMPLEMENTATION_HEADER } from './lib/identity.mjs';
 import { DriftDetector } from './analyze/drift-detector.mjs';
 import { injectOpenAICacheKey, resolveOpenAICacheKey } from './normalize/openai-cache-key.mjs';
 import { detectProvider } from './providers/detect.mjs';
@@ -15,11 +16,6 @@ import { resolveUpstreams, selectUpstream } from './providers/upstreams.mjs';
 import { createInMemoryTelemetryLedger, createTelemetryLedger } from './observability/ledger.mjs';
 
 const driftDetector = new DriftDetector();
-// Self-identification so any consumer (proxy, health check, or /v1/compress
-// caller) can distinguish this deterministic reimplementation from upstream
-// classic headroom, on every HTTP response (header) and in the compress body.
-const IMPLEMENTATION_NAME = 'headroom-lite';
-const IMPLEMENTATION_HEADER = 'x-headroom-implementation';
 const TELEMETRY_SCHEMA_VERSION = 1;
 const TELEMETRY_CAPABILITIES = Object.freeze({
   snapshot: true,
@@ -839,6 +835,7 @@ async function routeRequest(request, response, options) {
             response.writeHead(502, {
               'content-type': 'application/json; charset=utf-8',
               'content-length': String(Buffer.byteLength(msg)),
+              [IMPLEMENTATION_HEADER]: IMPLEMENTATION_NAME,
             });
             response.end(msg);
           } catch { /* socket already gone */ }
