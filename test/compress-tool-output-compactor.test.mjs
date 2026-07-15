@@ -37,6 +37,26 @@ describe('tryObjectArrayToCsv', () => {
     if (result !== null) assert.match(result, /^schema:/);
   });
 
+  it('passes ragged object rows through instead of dropping inconsistent columns', () => {
+    const arr = Array.from({ length: 24 }, (_, i) => ({
+      path: `/very/long/path/to/file-${i}.mjs`,
+      status: 'unchanged-value-that-makes-csv-smaller',
+      bytes: i * 1024,
+      ...(i === 11 ? { audit: 'must-not-disappear' } : {}),
+    }));
+
+    assert.equal(tryObjectArrayToCsv(arr), null);
+  });
+
+  it('passes nested object values through instead of stringifying them as object markers', () => {
+    const arr = Array.from({ length: 24 }, (_, i) => ({
+      path: `/very/long/path/to/file-${i}.mjs`,
+      meta: { bytes: i * 1024 },
+    }));
+
+    assert.equal(tryObjectArrayToCsv(arr), null);
+  });
+
   it('returns null for non-object array', () => {
     assert.equal(tryObjectArrayToCsv(['a', 'b', 'c']), null);
     assert.equal(tryObjectArrayToCsv([1, 2, 3]), null);
@@ -154,6 +174,95 @@ describe('compactJsonArray', () => {
     const result = compactJsonArray(JSON.stringify(arr));
     assert.ok(result !== null, 'should compact large object array');
     assert.match(result, /^schema:\[path,size\]|^schema:\[size,path\]/);
+  });
+
+  it('compacts whitespace-delimited JSON object sequences as tabular rows', () => {
+    const records = Array.from({ length: 25 }, (_, i) => (
+      JSON.stringify({ path: `/src/file${i}.mjs`, size: i * 512 })
+    )).join(' ');
+
+    const result = compactJsonArray(records);
+
+    assert.ok(result !== null, 'should compact JSON sequence');
+    assert.match(result, /^schema:\[path,size\]|^schema:\[size,path\]/);
+  });
+
+  it('does not treat object-boundary text inside JSON strings as sequence delimiters', () => {
+    const records = Array.from({ length: 25 }, (_, i) => (
+      JSON.stringify({
+        path: `/src/file${i}.mjs`,
+        message: i === 12 ? 'literal braces } { must survive' : `routine message ${i}`,
+      })
+    )).join(' ');
+
+    const result = compactJsonArray(records);
+
+    assert.ok(result !== null, 'should compact JSON sequence');
+    assert.match(result, /literal braces } { must survive/);
+    assert.doesNotMatch(result, /literal braces },\{ must survive/);
+  });
+
+  it('passes ragged JSON object arrays through unchanged', () => {
+    const arr = Array.from({ length: 24 }, (_, i) => ({
+      path: `/very/long/path/to/file-${i}.mjs`,
+      status: 'unchanged-value-that-makes-csv-smaller',
+      bytes: i * 1024,
+      ...(i === 11 ? { audit: 'must-not-disappear' } : {}),
+    }));
+
+    assert.equal(compactJsonArray(JSON.stringify(arr)), null);
+  });
+
+  it('passes JSON sequences with nested object cells through unchanged', () => {
+    const records = Array.from({ length: 25 }, (_, i) => (
+      JSON.stringify({ path: `/src/file${i}.mjs`, meta: { size: i } })
+    )).join(' ');
+
+    assert.equal(compactJsonArray(records), null);
+  });
+
+  it('fails closed in audit-safe mode when a protected string row would be omitted', () => {
+    const arr = Array.from({ length: 40 }, (_, i) => (
+      i === 20 ? 'ERROR-KEEP exact protected row' : `routine-row-${i}`
+    ));
+
+    assert.ok(compactJsonArray(JSON.stringify(arr)) !== null, 'default behavior should still compact');
+    assert.equal(
+      compactJsonArray(JSON.stringify(arr), {
+        auditSafe: true,
+        protectedPatterns: [/ERROR-KEEP/],
+      }),
+      null,
+    );
+  });
+
+  it('fails closed in audit-safe mode when a protected number row would be omitted', () => {
+    const arr = Array.from({ length: 100 }, (_, i) => i);
+
+    assert.ok(compactJsonArray(JSON.stringify(arr)) !== null, 'default behavior should still compact');
+    assert.equal(
+      compactJsonArray(JSON.stringify(arr), {
+        auditSafe: true,
+        protectedPatterns: ['20'],
+      }),
+      null,
+    );
+  });
+
+  it('fails closed in audit-safe mode when an object row matches a protected pattern', () => {
+    const arr = Array.from({ length: 24 }, (_, i) => ({
+      path: `/very/long/path/to/file-${i}.mjs`,
+      status: i === 11 ? 'AUDIT-KEEP' : 'routine-status-value',
+    }));
+
+    assert.ok(compactJsonArray(JSON.stringify(arr)) !== null, 'default behavior should still compact');
+    assert.equal(
+      compactJsonArray(JSON.stringify(arr), {
+        auditSafe: true,
+        protectedPatterns: [/AUDIT-KEEP/],
+      }),
+      null,
+    );
   });
 
   it('compacts large string array', () => {

@@ -23,32 +23,32 @@ const MIN_ACCEPTANCE_RATIO = 1.0;
 // Head/tail item counts for string/number arrays
 const HEAD_KEEP = 10;
 const TAIL_KEEP = 5;
-// Minimum fraction of keys an object must share to be considered "consistent schema"
-const SCHEMA_CONSISTENCY_THRESHOLD = 0.6;
+const JSON_SEQUENCE_BOUNDARY_RE = /}\s*{/;
 
 // ── CSV-schema helpers ────────────────────────────────────────────────────────
 
 /**
- * Extract the dominant key set from an object array.
+ * Extract the exact key set from an object array.
  * Returns null if array is too heterogeneous for CSV compaction.
  */
-function dominantKeys(arr) {
+function consistentKeys(arr) {
   if (arr.length === 0) return null;
 
-  // Count key frequency across all objects
-  const freq = new Map();
+  let keys = null;
   for (const obj of arr) {
     if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
-    for (const k of Object.keys(obj)) {
-      freq.set(k, (freq.get(k) ?? 0) + 1);
+
+    const rowKeys = Object.keys(obj);
+    if (keys === null) {
+      keys = rowKeys;
+      continue;
+    }
+
+    if (rowKeys.length !== keys.length) return null;
+    for (let index = 0; index < keys.length; index += 1) {
+      if (rowKeys[index] !== keys[index]) return null;
     }
   }
-
-  // Keys present in >= SCHEMA_CONSISTENCY_THRESHOLD fraction of objects
-  const threshold = Math.ceil(arr.length * SCHEMA_CONSISTENCY_THRESHOLD);
-  const keys = [...freq.entries()]
-    .filter(([, count]) => count >= threshold)
-    .map(([k]) => k);
 
   // Need at least 2 consistent keys for CSV to be worthwhile
   return keys.length >= 2 ? keys : null;
@@ -56,6 +56,7 @@ function dominantKeys(arr) {
 
 function csvEscape(value) {
   if (value === null || value === undefined) return '';
+  if (typeof value === 'object') return null;
   const s = String(value);
   // Escape if contains comma, newline, or quote
   if (s.includes(',') || s.includes('\n') || s.includes('"')) {
@@ -64,19 +65,61 @@ function csvEscape(value) {
   return s;
 }
 
+function protectedPatterns({ auditSafe = false, protectedPatterns = [] } = {}) {
+  return auditSafe && Array.isArray(protectedPatterns) ? protectedPatterns : [];
+}
+
+function patternMatches(pattern, text) {
+  if (pattern instanceof RegExp) {
+    pattern.lastIndex = 0;
+    return pattern.test(text);
+  }
+  return typeof pattern === 'string' && text.includes(pattern);
+}
+
+function rowText(row) {
+  if (typeof row === 'string') return row;
+  const json = JSON.stringify(row);
+  return json === undefined ? String(row) : json;
+}
+
+function protectedRowIndexes(arr, options) {
+  const patterns = protectedPatterns(options);
+  if (patterns.length === 0) return [];
+
+  const indexes = [];
+  for (let index = 0; index < arr.length; index += 1) {
+    const text = rowText(arr[index]);
+    if (patterns.some((pattern) => patternMatches(pattern, text))) indexes.push(index);
+  }
+  return indexes;
+}
+
+function compactedIndexes(arrLength) {
+  const indexes = new Set();
+  const tailStart = Math.max(HEAD_KEEP, arrLength - TAIL_KEEP);
+  for (let index = 0; index < Math.min(HEAD_KEEP, arrLength); index += 1) indexes.add(index);
+  for (let index = tailStart; index < arrLength; index += 1) indexes.add(index);
+  return indexes;
+}
+
 /**
  * Convert a uniform object array to CSV-schema format.
  * Format: schema:[key1,key2,...]\nv1,v2\nv3,v4\n...
  * Returns null if not applicable or the candidate does not shrink the input.
  */
-export function tryObjectArrayToCsv(arr) {
-  const keys = dominantKeys(arr);
+export function tryObjectArrayToCsv(arr, options = {}) {
+  const keys = consistentKeys(arr);
   if (!keys) return null;
+  if (protectedRowIndexes(arr, options).length > 0) return null;
 
   const header = `schema:[${keys.join(',')}]`;
-  const rows = arr.map((obj) =>
-    keys.map((k) => csvEscape(obj?.[k])).join(',')
-  );
+  const rows = [];
+  for (const obj of arr) {
+    const cells = keys.map((k) => csvEscape(obj?.[k]));
+    if (cells.includes(null)) return null;
+    rows.push(cells.join(','));
+  }
 
   const result = [header, ...rows].join('\n');
   const original = JSON.stringify(arr);
@@ -91,7 +134,7 @@ export function tryObjectArrayToCsv(arr) {
  * Compact a long string array: keep head + tail, omit middle.
  * Preserves error/anomaly strings (items containing error keywords).
  */
-export function compactStringArray(arr) {
+export function compactStringArray(arr, options = {}) {
   if (arr.length <= MIN_ITEMS) return null;
 
   const n = arr.length;
@@ -100,6 +143,8 @@ export function compactStringArray(arr) {
   const omittedCount = n - headItems.length - tailItems.length;
 
   if (omittedCount <= 0) return null;
+  const keptIndexes = compactedIndexes(n);
+  if (protectedRowIndexes(arr, options).some((index) => !keptIndexes.has(index))) return null;
 
   const parts = [...headItems];
   parts.push(`[${omittedCount} items omitted]`);
@@ -126,7 +171,7 @@ function median(sorted) {
 /**
  * Compact a long number array: head + tail + stats summary string.
  */
-export function compactNumberArray(arr) {
+export function compactNumberArray(arr, options = {}) {
   if (arr.length <= MIN_ITEMS) return null;
 
   const finite = arr.filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
@@ -138,6 +183,8 @@ export function compactNumberArray(arr) {
   const omittedCount = n - headItems.length - tailItems.length;
 
   if (omittedCount <= 0) return null;
+  const keptIndexes = compactedIndexes(n);
+  if (protectedRowIndexes(arr, options).some((index) => !keptIndexes.has(index))) return null;
 
   const avg = mean(finite).toFixed(4);
   const med = median(finite).toFixed(4);
@@ -153,22 +200,79 @@ export function compactNumberArray(arr) {
 
 // ── Main entry point ──────────────────────────────────────────────────────────
 
+function parseJsonSequence(trimmed) {
+  if (!trimmed.startsWith('{') || !JSON_SEQUENCE_BOUNDARY_RE.test(trimmed)) return null;
+
+  try {
+    const rows = [];
+    let depth = 0;
+    let start = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let index = 0; index < trimmed.length; index += 1) {
+      const char = trimmed[index];
+
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === '\\') {
+          escaped = true;
+        } else if (char === '"') {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (char === '"') {
+        inString = true;
+        continue;
+      }
+
+      if (char === '{') {
+        depth += 1;
+        continue;
+      }
+
+      if (char === '}') {
+        depth -= 1;
+        if (depth !== 0) continue;
+
+        rows.push(JSON.parse(trimmed.slice(start, index + 1)));
+
+        let next = index + 1;
+        while (next < trimmed.length && /\s/u.test(trimmed[next])) next += 1;
+        if (next >= trimmed.length) return rows.length > 1 ? rows : null;
+        if (trimmed[next] !== '{') return null;
+        start = next;
+        index = next - 1;
+      }
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Attempt to compact a JSON array string from a tool result.
+ * Attempt to compact a JSON array or whitespace-delimited JSON object sequence from a tool result.
  * Returns the compacted string, or null if not applicable / no savings.
  */
-export function compactJsonArray(text) {
+export function compactJsonArray(text, options = {}) {
   if (!text || typeof text !== 'string') return null;
 
   const trimmed = text.trimStart();
-  // Quick gate: must look like a JSON array
-  if (!trimmed.startsWith('[')) return null;
 
   let arr;
-  try {
-    arr = JSON.parse(trimmed);
-  } catch {
-    return null;
+  if (trimmed.startsWith('[')) {
+    try {
+      arr = JSON.parse(trimmed);
+    } catch {
+      return null;
+    }
+  } else {
+    arr = parseJsonSequence(trimmed);
   }
 
   if (!Array.isArray(arr) || arr.length <= MIN_ITEMS) return null;
@@ -179,15 +283,15 @@ export function compactJsonArray(text) {
 
   if (typeof sample === 'object' && !Array.isArray(sample)) {
     // Object array — try CSV-schema (most compact)
-    return tryObjectArrayToCsv(arr);
+    return tryObjectArrayToCsv(arr, options);
   }
 
   if (typeof sample === 'string') {
-    return compactStringArray(arr);
+    return compactStringArray(arr, options);
   }
 
   if (typeof sample === 'number') {
-    return compactNumberArray(arr);
+    return compactNumberArray(arr, options);
   }
 
   return null;
@@ -196,7 +300,7 @@ export function compactJsonArray(text) {
 // ── Pipeline integration helpers ──────────────────────────────────────────────
 
 /**
- * Walk messages and compact JSON arrays in tool_result content blocks.
+ * Walk messages and compact JSON arrays/sequences in tool_result content blocks.
  *
  * Only applied to:
  * - Messages with role 'tool' or content blocks with type 'tool_result'
@@ -205,7 +309,7 @@ export function compactJsonArray(text) {
  *
  * Mutates messages in-place (caller passes a structuredClone).
  */
-export function compactToolOutputs(messages, latestMessageIndex) {
+export function compactToolOutputs(messages, latestMessageIndex, options = {}) {
   for (let i = 0; i < messages.length; i++) {
     if (i === latestMessageIndex) continue;
 
@@ -218,7 +322,7 @@ export function compactToolOutputs(messages, latestMessageIndex) {
     if (role === 'tool') {
       const content = msg.content;
       if (typeof content === 'string') {
-        const compacted = compactJsonArray(content);
+        const compacted = compactJsonArray(content, options);
         if (compacted !== null) msg.content = compacted;
       }
       continue;
@@ -234,7 +338,7 @@ export function compactToolOutputs(messages, latestMessageIndex) {
 
       // tool_result content can be a string or array of blocks
       if (typeof block.content === 'string') {
-        const compacted = compactJsonArray(block.content);
+        const compacted = compactJsonArray(block.content, options);
         if (compacted !== null) block.content = compacted;
         continue;
       }
@@ -243,7 +347,7 @@ export function compactToolOutputs(messages, latestMessageIndex) {
         for (const inner of block.content) {
           if (!inner || inner.type !== 'text' || typeof inner.text !== 'string') continue;
           if (inner.cache_control) continue;
-          const compacted = compactJsonArray(inner.text);
+          const compacted = compactJsonArray(inner.text, options);
           if (compacted !== null) inner.text = compacted;
         }
       }

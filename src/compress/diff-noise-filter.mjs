@@ -16,6 +16,13 @@ const LOCKFILE_NAMES = new Set([
   'poetry.lock', 'Gemfile.lock', 'composer.lock', 'go.sum',
 ]);
 
+function normalizeDiffLines(diffText) {
+  return diffText
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+$/u, ''));
+}
+
 function getFilename(sectionLines) {
   for (const line of sectionLines) {
     const gitMatch = line.match(/^diff --git a\/(.+) b\/.+$/);
@@ -69,7 +76,16 @@ function filterWhitespaceHunks(sectionLines) {
       (line) => line.startsWith('+') || line.startsWith('-'),
     );
     if (changedLines.length === 0) return false;
-    return !changedLines.every((line) => line.slice(1).trim() === '');
+    if (changedLines.every((line) => line.slice(1).trim() === '')) return false;
+
+    const removed = hunk.filter((line) => line.startsWith('-')).map((line) => line.slice(1));
+    const added = hunk.filter((line) => line.startsWith('+')).map((line) => line.slice(1));
+    if (removed.length > 0 && removed.length === added.length &&
+        removed.every((line, index) => line === added[index])) {
+      return false;
+    }
+
+    return true;
   });
 
   // If all hunks were noise, drop the whole section (header included)
@@ -81,7 +97,7 @@ function filterWhitespaceHunks(sectionLines) {
 export function filterDiffNoise(diffText) {
   if (!diffText) return '';
 
-  const lines = diffText.split('\n');
+  const lines = normalizeDiffLines(diffText);
 
   // Use `diff --git` boundaries when present; fall back to `--- ` for plain patches
   const hasGitHeaders = lines.some((l) => l.startsWith('diff --git '));
