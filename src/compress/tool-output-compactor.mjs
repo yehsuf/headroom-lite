@@ -18,8 +18,8 @@
 
 // Minimum items before compaction is attempted (mirrors SmartCrusher passthrough guard)
 export const MIN_ITEMS = 9;
-// Minimum byte-savings ratio to apply compaction (avoids tiny wins with added overhead)
-const MIN_SAVINGS_RATIO = 0.15;
+// Accept any positive shrink. Mirrors upstream headroom 0.31.0's min_ratio=1.0 gate.
+const MIN_ACCEPTANCE_RATIO = 1.0;
 // Head/tail item counts for string/number arrays
 const HEAD_KEEP = 10;
 const TAIL_KEEP = 5;
@@ -67,7 +67,7 @@ function csvEscape(value) {
 /**
  * Convert a uniform object array to CSV-schema format.
  * Format: schema:[key1,key2,...]\nv1,v2\nv3,v4\n...
- * Returns null if not applicable or savings below threshold.
+ * Returns null if not applicable or the candidate does not shrink the input.
  */
 export function tryObjectArrayToCsv(arr) {
   const keys = dominantKeys(arr);
@@ -80,7 +80,7 @@ export function tryObjectArrayToCsv(arr) {
 
   const result = [header, ...rows].join('\n');
   const original = JSON.stringify(arr);
-  if (result.length >= original.length * (1 - MIN_SAVINGS_RATIO)) return null;
+  if (result.length / original.length >= MIN_ACCEPTANCE_RATIO) return null;
 
   return result;
 }
@@ -107,7 +107,7 @@ export function compactStringArray(arr) {
 
   const result = JSON.stringify(parts);
   const original = JSON.stringify(arr);
-  if (result.length >= original.length * (1 - MIN_SAVINGS_RATIO)) return null;
+  if (result.length / original.length >= MIN_ACCEPTANCE_RATIO) return null;
 
   return result;
 }
@@ -146,7 +146,7 @@ export function compactNumberArray(arr) {
   const parts = [...headItems, stats, ...tailItems];
   const result = JSON.stringify(parts);
   const original = JSON.stringify(arr);
-  if (result.length >= original.length * (1 - MIN_SAVINGS_RATIO)) return null;
+  if (result.length / original.length >= MIN_ACCEPTANCE_RATIO) return null;
 
   return result;
 }

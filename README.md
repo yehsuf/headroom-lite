@@ -14,7 +14,7 @@ npm install -g @yehsuf/headroom-lite
 
 Or pin to a version:
 ```bash
-npm install -g @yehsuf/headroom-lite@0.3.0
+npm install -g @yehsuf/headroom-lite@0.31.0
 ```
 
 Requires a GitHub token with `read:packages` permission:

@@ -1,3 +1,5 @@
+import { estimateTokenCount } from '../lib/estimate-tokens.mjs';
+
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const RUN_MARKER_RE = /^\.\.\. \(repeated (\d+) times\)$/;
 const GREP_ROW_RE = /^(?<path>[^\n:]+):(?<line>\d+):(?<content>.*)$/;
@@ -202,8 +204,8 @@ export function pathUnheading(text) {
   return joinLines(output, hadTrailingNewline);
 }
 
-function isSmaller(candidate, original) {
-  return candidate.length < original.length;
+function savesTokens(candidate, original) {
+  return estimateTokenCount(candidate) < estimateTokenCount(original);
 }
 
 export function compactLossless(content, kind) {
@@ -217,24 +219,24 @@ export function compactLossless(content, kind) {
       // Anything larger can only come from an input-authored fake marker, so
       // bail out before allocating a disproportionate temporary buffer.
       if (expandRuns(candidate, { maxOutputLength: baseline.length }) !== baseline) return content;
-      return isSmaller(candidate, content) ? candidate : content;
+      return savesTokens(candidate, content) ? candidate : content;
     }
 
     if (kind === 'search') {
       const candidate = searchHeading(content);
       if (searchUnheading(candidate) !== content) return content;
-      return isSmaller(candidate, content) ? candidate : content;
+      return savesTokens(candidate, content) ? candidate : content;
     }
 
     if (kind === 'paths') {
       const candidate = pathHeading(content);
       if (pathUnheading(candidate) !== content) return content;
-      return isSmaller(candidate, content) ? candidate : content;
+      return savesTokens(candidate, content) ? candidate : content;
     }
 
     if (kind === 'diff') {
       const candidate = diffStripIndex(content);
-      return isSmaller(candidate, content) ? candidate : content;
+      return savesTokens(candidate, content) ? candidate : content;
     }
 
     if (kind === 'text') {
@@ -242,7 +244,7 @@ export function compactLossless(content, kind) {
       // See the log path above: round-trip verification should never need to
       // reconstruct more than the original text length.
       if (expandRuns(candidate, { maxOutputLength: content.length }) !== content) return content;
-      return isSmaller(candidate, content) ? candidate : content;
+      return savesTokens(candidate, content) ? candidate : content;
     }
   } catch {
     return content;

@@ -7,6 +7,7 @@ import {
   searchHeading,
   searchUnheading,
 } from '../src/compress/lossless-compaction.mjs';
+import { estimateTokenCount } from '../src/lib/estimate-tokens.mjs';
 
 describe('lossless compaction', () => {
   it('round-trips grep-shaped search output exactly', () => {
@@ -65,6 +66,24 @@ describe('lossless compaction', () => {
       () => expandRuns(candidate, { maxOutputLength: original.length }),
       /verification budget/,
     );
+    assert.equal(compactLossless(original, 'text'), original);
+  });
+
+  it('keeps verified folds that save tokens even when they do not save characters', () => {
+    const original = Array.from({ length: 5 }, () => 'a-b').join('\n');
+    const folded = 'a-b\n... (repeated 5 times)';
+
+    assert.ok(folded.length > original.length, 'fixture must not be accepted by character length');
+    assert.ok(estimateTokenCount(folded) < estimateTokenCount(original), 'fixture must save estimated tokens');
+    assert.equal(compactLossless(original, 'text'), folded);
+  });
+
+  it('rejects folds that shrink characters but do not save estimated tokens', () => {
+    const original = Array.from({ length: 2 }, () => 'a'.repeat(23)).join('\n');
+    const folded = `${'a'.repeat(23)}\n... (repeated 2 times)`;
+
+    assert.ok(folded.length < original.length, 'fixture would pass the old character-length gate');
+    assert.ok(estimateTokenCount(folded) > estimateTokenCount(original), 'fixture must not save estimated tokens');
     assert.equal(compactLossless(original, 'text'), original);
   });
 });

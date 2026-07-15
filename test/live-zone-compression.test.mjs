@@ -500,7 +500,7 @@ describe('compression enabled — frozen messages preserved', () => {
         ],
       },
       // Live: compressible, should be compressed
-      { role: 'assistant', content: makeCompressibleContent('live line', 6) },
+      { role: 'assistant', content: makeCompressibleContent('live-line', 6) },
       { role: 'user', content: 'final question' },
     ];
 
