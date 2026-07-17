@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { compressMessages, compressMessagesAsync } from './compress/pipeline.mjs';
 import { compressResponsesInput } from './compress/responses.mjs';
+import { estimateMessageTokens } from './lib/estimate-tokens.mjs';
 import { resolveLossyConfig } from './lossy/config.mjs';
 import { normalizeTools } from './normalize/tools.mjs';
 import { detectVolatileContent } from './analyze/volatile-detector.mjs';
@@ -333,6 +334,11 @@ function scheduleTelemetryFlush(server, telemetryLedger, telemetryState) {
         if (closePromise) return closePromise;
         closePromise = new Promise((resolve, reject) => {
           server.close((error) => (error ? reject(error) : resolve()));
+          // Drain idle keep-alive connections so server.close() resolves promptly
+          // without killing active in-flight requests (stream-lock release).
+          // Must be called AFTER server.close() — close() stops new accepts first,
+          // then closeIdleConnections() sweeps the already-idle sockets.
+          server.closeIdleConnections?.();
         });
         return closePromise;
       },
@@ -370,6 +376,8 @@ function scheduleTelemetryFlush(server, telemetryLedger, telemetryState) {
         }
         Promise.resolve(flushAfterClose()).then(resolve, reject);
       });
+      // Drain idle keep-alive connections after close() stops new accepts.
+      server.closeIdleConnections?.();
     });
     return closeAndFlushPromise;
   };
@@ -545,7 +553,17 @@ export function resolveMaxBodyBytes(input = process.env.HEADROOM_LITE_MAX_BODY_B
   return parseIntOption(input, DEFAULT_MAX_BODY_BYTES);
 }
 
-async function handleCompress(request, response, { maxBodyBytes, compressLive, lossyConfig, telemetryLedger, telemetryState, statsState }) {
+/**
+ * Resolve the HEADROOM_LITE_MIN_TOKENS env var.
+ * When > 0, /v1/compress skips compression and returns messages as-is if the
+ * estimated token count is below the threshold. Default: 0 (always compress).
+ * Mirrors upstream headroom's HEADROOM_MIN_TOKENS semantics.
+ */
+export function resolveMinTokens(input = process.env.HEADROOM_LITE_MIN_TOKENS) {
+  return parseIntOption(input, 0, { allowZero: true });
+}
+
+async function handleCompress(request, response, { maxBodyBytes, compressLive, lossyConfig, minTokens, telemetryLedger, telemetryState, statsState }) {
   const startedAt = Date.now();
   const telemetryEvent = {
     tokensBefore: 0,
@@ -600,6 +618,38 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
     throw new HttpError(400, '`messages` (or `input` with kind:"responses") must be a JSON array');
   }
 
+  // HEADROOM_LITE_MIN_TOKENS gate: when set to > 0, skip compression and return
+  // messages as-is if estimated token count is below the threshold. This mirrors
+  // upstream headroom's HEADROOM_MIN_TOKENS semantics and lets callers avoid
+  // compression overhead on short conversations.
+  if (!isResponses && minTokens > 0) {
+    const rawTokens = estimateMessageTokens(payload.messages);
+    if (rawTokens <= minTokens) {
+      const normalizedTools = Array.isArray(payload.tools) ? normalizeTools(payload.tools) : undefined;
+      const skippedBody = {
+        service: IMPLEMENTATION_NAME,
+        messages: payload.messages,
+        tokens_before: rawTokens,
+        tokens_after: rawTokens,
+        tokens_saved: 0,
+        compression_ratio: 1.0,
+        frozen_count: 0,
+        skipped_reason: 'below_min_tokens',
+      };
+      if (normalizedTools !== undefined) skippedBody.normalized_tools = normalizedTools;
+      // Count as a compress request so legacy statsState and persisted telemetry agree.
+      statsState.compressRequests++;
+      statsState.compressTokensBefore += rawTokens;
+      statsState.compressTokensAfter += rawTokens;
+      telemetryEvent.tokensBefore = rawTokens;
+      telemetryEvent.tokensAfter = rawTokens;
+      telemetryEvent.provider = payload.format === 'openai' ? 'openai' : 'anthropic';
+      telemetryEvent.model = typeof payload.model === 'string' ? payload.model : undefined;
+      writeJson(response, 200, skippedBody);
+      return;
+    }
+  }
+
   // Responses API path: compress the `input` array (typed items), mirror the key.
   if (isResponses) {
     const r = compressResponsesInput(payload.input, { compressLive });
@@ -612,6 +662,8 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
       input: r.items,
       tokens_before: r.tokensBefore,
       tokens_after: r.tokensAfter,
+      tokens_saved: Math.max(0, r.tokensBefore - r.tokensAfter),
+      compression_ratio: r.tokensBefore > 0 ? r.tokensAfter / r.tokensBefore : 1.0,
       frozen_count: r.frozenCount,
     };
     const normalizedTools = Array.isArray(payload.tools)
@@ -657,6 +709,8 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
     messages,
     tokens_before: tokensBefore,
     tokens_after: tokensAfter,
+    tokens_saved: Math.max(0, tokensBefore - tokensAfter),
+    compression_ratio: tokensBefore > 0 ? tokensAfter / tokensBefore : 1.0,
     frozen_count: frozenCount,
   };
   if (normalizedTools !== undefined) responseBody.normalized_tools = normalizedTools;
@@ -797,6 +851,14 @@ async function routeRequest(request, response, options) {
     return;
   }
 
+  // GH #1787: browsers auto-fetch /favicon.ico; answer locally so it is never
+  // tunneled to the upstream provider.
+  if (method === 'GET' && url.pathname === '/favicon.ico') {
+    response.writeHead(204, { [IMPLEMENTATION_HEADER]: IMPLEMENTATION_NAME });
+    response.end();
+    return;
+  }
+
   if (method === 'POST' && url.pathname === '/v1/compress') {
     await handleCompress(request, response, options);
     return;
@@ -858,6 +920,7 @@ export function createServer({
   compressProxy = resolveCompressProxy(),
   compressLive = resolveCompressLive(),
   lossyConfig = resolveLossyConfig(),
+  minTokens = resolveMinTokens(),
   telemetryLedger = undefined,
   statsPathInput = process.env.HEADROOM_LITE_STATS_PATH,
   statsMaxPointsInput = process.env.HEADROOM_LITE_STATS_MAX_POINTS,
@@ -886,6 +949,7 @@ export function createServer({
       compressProxy,
       compressLive,
       lossyConfig,
+      minTokens,
       telemetryLedger: resolvedTelemetryLedger,
       telemetryState,
       statsState,
@@ -906,6 +970,10 @@ export function createServer({
   });
 
   server.on('clientError', (error, socket) => {
+    // Silently drop disconnected clients and unwritable sockets.
+    // Note: HPE_INVALID_METHOD can fire when an HTTP/2 client accidentally connects
+    // to this HTTP/1.1-only server; respond with 400 so the client learns H/2 is
+    // not supported (same as node's default behavior).
     if (error.code === 'ECONNRESET' || !socket.writable) return;
     socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
   });
@@ -950,6 +1018,7 @@ export function startServer({
   compressProxy = resolveCompressProxy(),
   compressLive = resolveCompressLive(),
   lossyConfig = resolveLossyConfig(),
+  minTokens = resolveMinTokens(),
   telemetryLedger = undefined,
   statsPathInput = process.env.HEADROOM_LITE_STATS_PATH,
   statsMaxPointsInput = process.env.HEADROOM_LITE_STATS_MAX_POINTS,
@@ -977,6 +1046,7 @@ export function startServer({
     compressProxy,
     compressLive,
     lossyConfig,
+    minTokens,
     telemetryLedger: resolvedTelemetryLedger,
   });
 

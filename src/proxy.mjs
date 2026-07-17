@@ -173,6 +173,10 @@ export function proxyRequest(inboundReq, inboundRes, { upstream, timeoutMs = DEF
       clientClosed = true;
       upstreamReq.destroy();
       upstreamRes?.destroy();
+      // Release the response stream lock — destroy() does not trigger 'end' on the
+      // pipe target, so without this the inboundRes socket stays open indefinitely
+      // for long-running SSE or keep-alive streams after client disconnect.
+      if (!inboundRes.destroyed) inboundRes.destroy();
     }
   };
   clientSocket?.on('close', onClientSocketClose);

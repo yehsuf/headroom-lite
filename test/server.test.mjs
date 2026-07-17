@@ -569,6 +569,8 @@ describe('HTTP server', () => {
       messages: expected.messages,
       tokens_before: expected.tokensBefore,
       tokens_after: expected.tokensAfter,
+      tokens_saved: Math.max(0, expected.tokensBefore - expected.tokensAfter),
+      compression_ratio: expected.tokensBefore > 0 ? expected.tokensAfter / expected.tokensBefore : 1.0,
       frozen_count: expected.frozenCount,
     });
     assert.ok(body.tokens_after < body.tokens_before);
@@ -1367,5 +1369,79 @@ describe('headroom-parity gap endpoints', () => {
       assert.equal(body.service, 'headroom-lite');
       assert.ok(typeof body.reason === 'string' && body.reason.length > 0, `${path} needs a reason`);
     }
+  });
+
+  // ── B4: favicon 204 ───────────────────────────────────────────────────────
+  it('returns 204 for GET /favicon.ico and never proxies it (B4 #1787)', async () => {
+    const res = await fetch(`${baseUrl}/favicon.ico`);
+    assert.equal(res.status, 204, '/favicon.ico should be 204 No Content');
+    const body = await res.text();
+    assert.equal(body, '', 'favicon response must have no body');
+  });
+
+  // ── B4: tokens_saved + compression_ratio in /v1/compress response ─────────
+  it('includes tokens_saved and compression_ratio in /v1/compress response', async () => {
+    const res = await fetch(`${baseUrl}/v1/compress`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'Hello' }] }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.ok(typeof body.tokens_saved === 'number', 'tokens_saved must be a number');
+    assert.ok(typeof body.compression_ratio === 'number', 'compression_ratio must be a number');
+    assert.ok(body.compression_ratio >= 0 && body.compression_ratio <= 1.0, 'compression_ratio must be in [0, 1]');
+    assert.equal(body.tokens_saved, Math.max(0, body.tokens_before - body.tokens_after));
+  });
+
+  // ── B4: HEADROOM_LITE_MIN_TOKENS gate ─────────────────────────────────────
+  it('skips compression and returns messages as-is when below HEADROOM_LITE_MIN_TOKENS', async () => {
+    const minTokenServer = createServer({ minTokens: 999999 });
+    await new Promise((resolve) => minTokenServer.listen(0, '127.0.0.1', resolve));
+    const minTokenPort = minTokenServer.address().port;
+    try {
+      const res = await fetch(`http://127.0.0.1:${minTokenPort}/v1/compress`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'Short message' }] }),
+      });
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(body.skipped_reason, 'below_min_tokens', 'should indicate skip reason');
+      assert.equal(body.tokens_saved, 0, 'no tokens saved when skipped');
+      assert.equal(body.compression_ratio, 1.0, 'compression_ratio must be 1.0 when skipped');
+      assert.deepEqual(body.messages, [{ role: 'user', content: 'Short message' }], 'messages returned as-is');
+    } finally {
+      await new Promise((resolve) => minTokenServer.close(resolve));
+    }
+  });
+
+  it('compresses normally when token count exceeds HEADROOM_LITE_MIN_TOKENS threshold', async () => {
+    const minTokenServer = createServer({ minTokens: 1 });
+    await new Promise((resolve) => minTokenServer.listen(0, '127.0.0.1', resolve));
+    const minTokenPort = minTokenServer.address().port;
+    try {
+      const res = await fetch(`http://127.0.0.1:${minTokenPort}/v1/compress`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'Hello' }] }),
+      });
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.ok(!body.skipped_reason, 'should not skip when above threshold');
+    } finally {
+      await new Promise((resolve) => minTokenServer.close(resolve));
+    }
+  });
+
+  it('compresses normally when minTokens is 0 (default — no minimum)', async () => {
+    const res = await fetch(`${baseUrl}/v1/compress`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'Hi' }] }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.ok(!body.skipped_reason, 'minTokens=0 must never trigger skip');
   });
 });
