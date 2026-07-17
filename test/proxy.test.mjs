@@ -422,6 +422,58 @@ describe('SSE passthrough', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Stream-lock release: inboundRes destroyed on client disconnect (B4)
+// ---------------------------------------------------------------------------
+
+describe('stream-lock release on client disconnect', () => {
+  it('destroys inboundRes when client socket closes mid-stream', async () => {
+    // Upstream holds the response open indefinitely (simulates a long SSE or slow stream).
+    let resolveHold;
+    const hold = new Promise((r) => { resolveHold = r; });
+
+    const upstream = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('data: first\n\n');
+      // Never end — simulate an infinite stream
+      hold.then(() => res.end());
+    });
+    const upstreamPort = await listen(upstream);
+    const proxy = createServer({ upstream: `http://127.0.0.1:${upstreamPort}` });
+    const proxyPort = await listen(proxy);
+
+    let inboundResDestroyed = false;
+
+    // Intercept server response objects to detect destroy
+    const originalOnRequest = proxy._events.request ?? proxy.listeners('request')[0];
+    proxy.on('request', (_req, res) => {
+      res.on('close', () => { inboundResDestroyed = true; });
+    });
+
+    // Connect and immediately destroy the client socket mid-stream
+    await new Promise((resolve, reject) => {
+      const clientReq = http.request({ host: '127.0.0.1', port: proxyPort, path: '/stream' });
+      clientReq.on('response', (clientRes) => {
+        clientRes.once('data', () => {
+          // Received first chunk — now simulate client disconnect
+          clientReq.socket.destroy();
+          setTimeout(resolve, 150); // allow cleanup to propagate
+        });
+        clientRes.resume();
+      });
+      clientReq.on('error', () => {}); // suppress expected socket error
+      clientReq.end();
+      setTimeout(() => reject(new Error('timed out waiting for first SSE chunk')), 3000);
+    });
+
+    resolveHold();
+    assert.ok(inboundResDestroyed, 'inboundRes should be destroyed when client disconnects mid-stream');
+
+    await new Promise((resolve) => proxy.close(resolve));
+    await new Promise((resolve) => upstream.close(resolve));
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Status code passthrough
 // ---------------------------------------------------------------------------
 
