@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.32.0] - 2026-07-17
+
+### Added
+
+- **`GET /favicon.ico` → 204 No Content** — answered locally, never proxied to the upstream LLM provider (ports upstream headroom GH #1787).
+- **`HEADROOM_LITE_MIN_TOKENS` env var** — when set to N > 0, `/v1/compress` skips compression and returns messages as-is if the estimated token count ≤ N. Default: 0 (always compress). Mirrors upstream `HEADROOM_MIN_TOKENS` semantics.
+- **`tokens_saved` and `compression_ratio` in `/v1/compress` response** — parity with upstream headroom API contract. `compression_ratio = tokens_after / tokens_before` (< 1.0 = compressed, 1.0 = unchanged/skipped).
+
+### Fixed
+
+- **Stream-lock release on client disconnect** — `inboundRes.destroy()` is now called in `onClientSocketClose` so the response socket is cleaned up when the client drops mid-stream. Without this fix, `upstreamRes.destroy()` does not trigger `end` on the pipe target, leaving SSE/keep-alive response sockets open indefinitely after the client disconnects.
+- **Graceful-shutdown idle-connection drain** — `closeIdleConnections()` is now called immediately after `server.close()` (not before) so Node stops accepting new connections before sweeping idle keep-alive sockets. Ensures `closeAndFlushTelemetry` resolves promptly on shutdown without hanging on in-flight requests.
+
+### Not included (scope)
+
+- TOIN/CCR pattern store — ML, out of scope for headroom-lite's deterministic core.
+
 ## [0.31.0] - 2026-07-13
 
 ### Changed

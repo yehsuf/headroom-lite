@@ -333,10 +333,12 @@ function scheduleTelemetryFlush(server, telemetryLedger, telemetryState) {
       closeAndFlushTelemetry() {
         if (closePromise) return closePromise;
         closePromise = new Promise((resolve, reject) => {
-          // Drain keep-alive idle connections so server.close() resolves promptly
-          // without killing active in-flight requests (stream-lock release).
-          server.closeIdleConnections?.();
           server.close((error) => (error ? reject(error) : resolve()));
+          // Drain idle keep-alive connections so server.close() resolves promptly
+          // without killing active in-flight requests (stream-lock release).
+          // Must be called AFTER server.close() — close() stops new accepts first,
+          // then closeIdleConnections() sweeps the already-idle sockets.
+          server.closeIdleConnections?.();
         });
         return closePromise;
       },
@@ -367,9 +369,6 @@ function scheduleTelemetryFlush(server, telemetryLedger, telemetryState) {
       return closeAndFlushPromise;
     }
     closeAndFlushPromise = new Promise((resolve, reject) => {
-      // Drain keep-alive idle connections so server.close() resolves promptly
-      // without killing active in-flight SSE/streaming connections (stream-lock release).
-      server.closeIdleConnections?.();
       server.close((error) => {
         if (error) {
           reject(error);
@@ -377,6 +376,8 @@ function scheduleTelemetryFlush(server, telemetryLedger, telemetryState) {
         }
         Promise.resolve(flushAfterClose()).then(resolve, reject);
       });
+      // Drain idle keep-alive connections after close() stops new accepts.
+      server.closeIdleConnections?.();
     });
     return closeAndFlushPromise;
   };
@@ -636,6 +637,10 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
         skipped_reason: 'below_min_tokens',
       };
       if (normalizedTools !== undefined) skippedBody.normalized_tools = normalizedTools;
+      // Count as a compress request so legacy statsState and persisted telemetry agree.
+      statsState.compressRequests++;
+      statsState.compressTokensBefore += rawTokens;
+      statsState.compressTokensAfter += rawTokens;
       telemetryEvent.tokensBefore = rawTokens;
       telemetryEvent.tokensAfter = rawTokens;
       telemetryEvent.provider = payload.format === 'openai' ? 'openai' : 'anthropic';
