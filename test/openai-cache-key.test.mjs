@@ -70,6 +70,52 @@ describe('injectOpenAICacheKey()', () => {
     assert.equal(k1, k2);
   });
 
+  it('collects ALL system messages in order — single system + later system differ', () => {
+    // Regression: extractSystemText() used messages.find() and only hashed the first
+    // system message. Pipelines that inject a second system message (e.g. per-request
+    // context) would produce identical cache keys when the first message is shared.
+    const base = { model: 'gpt-4o' };
+    const sharedFirst = { role: 'system', content: 'You are a helpful assistant.' };
+    const k1 = injectOpenAICacheKey({
+      ...base,
+      messages: [sharedFirst, { role: 'user', content: 'hi' }, { role: 'system', content: 'Context: project A' }],
+    }).prompt_cache_key;
+    const k2 = injectOpenAICacheKey({
+      ...base,
+      messages: [sharedFirst, { role: 'user', content: 'hi' }, { role: 'system', content: 'Context: project B' }],
+    }).prompt_cache_key;
+    assert.notEqual(k1, k2, 'Different second system messages must produce different cache keys');
+  });
+
+  it('two system messages joined in order — order matters', () => {
+    const base = { model: 'gpt-4o' };
+    const k1 = injectOpenAICacheKey({ ...base, messages: [
+      { role: 'system', content: 'Part A' }, { role: 'system', content: 'Part B' },
+    ] }).prompt_cache_key;
+    const k2 = injectOpenAICacheKey({ ...base, messages: [
+      { role: 'system', content: 'Part B' }, { role: 'system', content: 'Part A' },
+    ] }).prompt_cache_key;
+    assert.notEqual(k1, k2, 'System message order must affect the cache key');
+  });
+
+  it('two system messages joined — single message with NUL matches split equivalent', () => {
+    // The extracted text concatenates all system content joined by \u0000,
+    // so two system messages "First" + "Second" matches one system message "First\u0000Second".
+    // This boundary cannot appear in normal prompt text.
+    const base = { model: 'gpt-4o' };
+    const twoMessages = injectOpenAICacheKey({ ...base, messages: [
+      { role: 'system', content: 'First' },
+      { role: 'system', content: 'Second' },
+    ] }).prompt_cache_key;
+    const oneMessage = injectOpenAICacheKey({ ...base, messages: [
+      { role: 'system', content: 'First\u0000Second' },
+    ] }).prompt_cache_key;
+    // The delimiter \u0000 makes these match — single-message with literal \u0000
+    // produces same key as two-message split. This is intentional: the separator
+    // is a cache-affinity hint only; correctness does not depend on uniqueness here.
+    assert.equal(twoMessages, oneMessage);
+  });
+
   it('works with no system message — key derived from model + tools only', () => {
     const body = { model: 'gpt-4o', messages: [{ role: 'user', content: 'hello' }] };
     const result = injectOpenAICacheKey(body);

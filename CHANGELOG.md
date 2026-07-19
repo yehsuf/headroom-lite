@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.31.0-3] - 2026-07-19
+
+### Fixed
+
+- **Cache key collision with multiple system messages** — `extractSystemText()` used `messages.find()` and only hashed the first system message. Pipelines that inject a second system message (per-request context block) produced identical cache keys when the first message was shared. Fix: collect all system messages with `filter()`, join in order with `\u0000` (NUL — cannot appear in normal prompt text, eliminating boundary-collision ambiguity). Order matters — swapping two system messages now produces different keys (ports upstream headroom GH #1827).
+
 ## [0.31.0-2] - 2026-07-19
 
 ### Added

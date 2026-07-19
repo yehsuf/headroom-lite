@@ -43,11 +43,15 @@ function deriveKey(model, systemText, toolNames) {
 }
 
 function extractSystemText(messages) {
-  // OpenAI: system is messages[0].role === 'system' with content as string or array
-  const sys = messages.find(m => m?.role === 'system');
-  if (!sys) return '';
-  return typeof sys.content === 'string' ? sys.content :
-    (Array.isArray(sys.content) ? sys.content.filter(b => b?.type === 'text').map(b => b.text).join('') : '');
+  // OpenAI: collect ALL system messages in order — some pipelines inject
+  // multiple system messages (e.g. an initial instructions block plus a
+  // per-request context block). Using only the first causes cache collisions
+  // when the first message is identical but a later system message differs.
+  const systemBlocks = messages.filter(m => m?.role === 'system');
+  return systemBlocks.map(sys =>
+    typeof sys.content === 'string' ? sys.content :
+      (Array.isArray(sys.content) ? sys.content.filter(b => b?.type === 'text').map(b => b.text).join('') : ''),
+  ).join('\u0000');
 }
 
 function extractToolNames(tools) {
