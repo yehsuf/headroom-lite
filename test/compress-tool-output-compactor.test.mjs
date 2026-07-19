@@ -287,6 +287,19 @@ describe('compactJsonArray', () => {
     // Should still be attempted (trimStart)
     if (result !== null) assert.doesNotThrow(() => JSON.parse(result));
   });
+
+  it('respects options.minItems override to compact arrays below the default floor', () => {
+    const arr = [
+      { path: '/src/file.mjs', size: 100 },
+      { path: '/src/file2.mjs', size: 200 },
+      { path: '/src/file3.mjs', size: 300 },
+    ];
+    const text = JSON.stringify(arr);
+    assert.equal(compactJsonArray(text), null, 'default: too small, must be null');
+    const result = compactJsonArray(text, { minItems: 1 });
+    assert.ok(result !== null, 'with minItems=1: should compact small object array to CSV');
+    assert.match(result, /^schema:\[/);
+  });
 });
 
 // ── compactToolOutputs ────────────────────────────────────────────────────────
@@ -378,6 +391,52 @@ describe('compactToolOutputs', () => {
     const cloned = structuredClone(messages);
     compactToolOutputs(cloned, cloned.length - 1);
     assert.equal(cloned[0].content, small, 'small array must not be compacted');
+  });
+
+  it('compacts small object arrays when aggregate tool output exceeds byte floor (Anthropic)', () => {
+    // 3-item object array — below MIN_ITEMS individually, but total content > AGGREGATE_FLOOR_BYTES
+    const smallArr = Array.from({ length: 3 }, (_, i) => ({
+      path: `/very/long/path/to/filename-${i}.mjs`,
+      content: 'x'.repeat(700),
+    }));
+    const content = JSON.stringify(smallArr);
+    assert.ok(content.length >= 2000, `fixture must be >= 2000 bytes (got ${content.length})`);
+
+    const messages = [
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'id1', content: [{ type: 'text', text: content }] },
+        ],
+      },
+      { role: 'assistant', content: 'ok' },
+    ];
+    const cloned = structuredClone(messages);
+    compactToolOutputs(cloned, cloned.length - 1);
+    const result = cloned[0].content[0].content[0].text;
+    assert.notEqual(result, content, 'should be compacted when aggregate exceeds floor');
+    assert.match(result, /^schema:\[/);
+  });
+
+  it('does not compact small arrays when aggregate tool output is below char floor', () => {
+    // 3-item 2-key array — short enough that total content is well below AGGREGATE_FLOOR_CHARS.
+    // Uses 2+ keys so tryObjectArrayToCsv *would* succeed if called (non-tautological guard).
+    const small = JSON.stringify([
+      { path: '/a.mjs', size: 1 },
+      { path: '/b.mjs', size: 2 },
+      { path: '/c.mjs', size: 3 },
+    ]);
+    assert.ok(small.length < 2000, `fixture must be below floor (got ${small.length})`);
+    // Sanity: same array IS compacted when minItems is forced to 0
+    assert.ok(compactJsonArray(small, { minItems: 0 }) !== null, 'fixture must compact with minItems=0');
+
+    const messages = [
+      { role: 'tool', tool_call_id: 'id1', content: small },
+      { role: 'assistant', content: 'ok' },
+    ];
+    const cloned = structuredClone(messages);
+    compactToolOutputs(cloned, cloned.length - 1);
+    assert.equal(cloned[0].content, small, 'must not compact when aggregate is below floor');
   });
 });
 

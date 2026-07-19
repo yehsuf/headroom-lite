@@ -20,6 +20,15 @@
 export const MIN_ITEMS = 9;
 // Accept any positive shrink. Mirrors upstream headroom 0.31.0's min_ratio=1.0 gate.
 const MIN_ACCEPTANCE_RATIO = 1.0;
+// When total tool output chars in one message exceeds this, per-block minItems drops to
+// MIN_ITEMS_AGGREGATE so that small individual outputs in a large batch compress.
+// (Counts UTF-16 code units via .length — close enough for JSON-heavy payloads.)
+// Ports upstream headroom GH #2050/#2116.
+const AGGREGATE_FLOOR_CHARS = 2000;
+// Per-block minimum when aggregate floor is triggered. Set to 0 so that the
+// savings-ratio check in tryObjectArrayToCsv acts as the sole gatekeeper; empty
+// arrays (length=0) are naturally ineligible and handled by the sample-search below.
+const MIN_ITEMS_AGGREGATE = 0;
 // Head/tail item counts for string/number arrays
 const HEAD_KEEP = 10;
 const TAIL_KEEP = 5;
@@ -258,6 +267,16 @@ export function parseJsonSequence(trimmed) {
 /**
  * Attempt to compact a JSON array or whitespace-delimited JSON object sequence from a tool result.
  * Returns the compacted string, or null if not applicable / no savings.
+ *
+ * `options.minItems` overrides the default MIN_ITEMS gate. Note: this override only lowers
+ * the outer item-count gate; `compactStringArray` and `compactNumberArray` apply their own
+ * internal MIN_ITEMS guard (needed for head+tail savings to fire). Object arrays (CSV-schema
+ * path via `tryObjectArrayToCsv`) benefit at any size ≥ 1.
+ *
+ * Note on CSV-schema type fidelity: `tryObjectArrayToCsv` coerces values via String(), mapping
+ * null/undefined to '' and collapsing number-vs-string distinctions. This is an accepted
+ * trade-off for token savings and is pre-existing; the aggregate floor widens its reach to
+ * arrays with fewer items.
  */
 export function compactJsonArray(text, options = {}) {
   if (!text || typeof text !== 'string') return null;
@@ -275,7 +294,8 @@ export function compactJsonArray(text, options = {}) {
     arr = parseJsonSequence(trimmed);
   }
 
-  if (!Array.isArray(arr) || arr.length <= MIN_ITEMS) return null;
+  const limit = options.minItems ?? MIN_ITEMS;
+  if (!Array.isArray(arr) || arr.length <= limit) return null;
 
   // Detect array type from first non-null element
   const sample = arr.find((x) => x !== null && x !== undefined);
@@ -300,12 +320,48 @@ export function compactJsonArray(text, options = {}) {
 // ── Pipeline integration helpers ──────────────────────────────────────────────
 
 /**
+ * Collect all tool output text strings from a message without mutating it.
+ * Used to compute aggregate byte size for the per-message item-floor decision.
+ */
+function collectToolOutputTexts(msg) {
+  const texts = [];
+  const role = typeof msg.role === 'string' ? msg.role.toLowerCase() : '';
+
+  if (role === 'tool') {
+    if (typeof msg.content === 'string') texts.push(msg.content);
+    return texts;
+  }
+
+  if (!Array.isArray(msg.content)) return texts;
+
+  for (const block of msg.content) {
+    if (!block || typeof block !== 'object' || block.type !== 'tool_result' || block.cache_control) continue;
+
+    if (typeof block.content === 'string') {
+      texts.push(block.content);
+    } else if (Array.isArray(block.content)) {
+      for (const inner of block.content) {
+        if (inner && inner.type === 'text' && typeof inner.text === 'string' && !inner.cache_control) {
+          texts.push(inner.text);
+        }
+      }
+    }
+  }
+
+  return texts;
+}
+
+/**
  * Walk messages and compact JSON arrays/sequences in tool_result content blocks.
  *
  * Only applied to:
  * - Messages with role 'tool' or content blocks with type 'tool_result'
  * - text/string content within those blocks
  * - Not the latest message (latestMessageIndex)
+ *
+ * When the aggregate tool output in a single message exceeds AGGREGATE_FLOOR_CHARS,
+ * the per-block item minimum is lowered to MIN_ITEMS_AGGREGATE so that small
+ * individual outputs in a large batch are not silently skipped.
  *
  * Mutates messages in-place (caller passes a structuredClone).
  */
@@ -316,13 +372,19 @@ export function compactToolOutputs(messages, latestMessageIndex, options = {}) {
     const msg = messages[i];
     if (!msg) continue;
 
+    // Lower per-block minItems when the aggregate tool output in this message is large.
+    const aggregateBytes = collectToolOutputTexts(msg).reduce((sum, t) => sum + t.length, 0);
+    const effectiveOptions = aggregateBytes >= AGGREGATE_FLOOR_CHARS
+      ? { ...options, minItems: MIN_ITEMS_AGGREGATE }
+      : options;
+
     const role = typeof msg.role === 'string' ? msg.role.toLowerCase() : '';
 
     // OpenAI format: role='tool'
     if (role === 'tool') {
       const content = msg.content;
       if (typeof content === 'string') {
-        const compacted = compactJsonArray(content, options);
+        const compacted = compactJsonArray(content, effectiveOptions);
         if (compacted !== null) msg.content = compacted;
       }
       continue;
@@ -338,7 +400,7 @@ export function compactToolOutputs(messages, latestMessageIndex, options = {}) {
 
       // tool_result content can be a string or array of blocks
       if (typeof block.content === 'string') {
-        const compacted = compactJsonArray(block.content, options);
+        const compacted = compactJsonArray(block.content, effectiveOptions);
         if (compacted !== null) block.content = compacted;
         continue;
       }
@@ -347,7 +409,7 @@ export function compactToolOutputs(messages, latestMessageIndex, options = {}) {
         for (const inner of block.content) {
           if (!inner || inner.type !== 'text' || typeof inner.text !== 'string') continue;
           if (inner.cache_control) continue;
-          const compacted = compactJsonArray(inner.text, options);
+          const compacted = compactJsonArray(inner.text, effectiveOptions);
           if (compacted !== null) inner.text = compacted;
         }
       }
