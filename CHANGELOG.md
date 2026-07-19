@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.32.0-0] - 2026-07-19
+
+Version series bump: headroom-lite now tracks the **headroom 0.32.x feature set**.
+
+All behavioural improvements shipped in `0.31.0-2` through `0.31.0-5` originate from upstream headroom 0.32.x issues (#1742, #1827, #2050, #2116, #2140, #2145). The `0.31.0-N` series was labelled for 0.31.x API-contract compatibility; the API contract is unchanged in 0.32.x, but the compression behaviour now aligns with the 0.32.x generation. This release begins the `0.32.0-N` series — future patches will be `0.32.0-1`, `0.32.0-2`, etc.
+
+No code changes from `0.31.0-5`; version number and series label only.
+
 ## [0.31.0-5] - 2026-07-19
 
 ### Fixed
