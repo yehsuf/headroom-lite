@@ -200,7 +200,7 @@ export function compactNumberArray(arr, options = {}) {
 
 // ── Main entry point ──────────────────────────────────────────────────────────
 
-function parseJsonSequence(trimmed) {
+export function parseJsonSequence(trimmed) {
   if (!trimmed.startsWith('{') || !JSON_SEQUENCE_BOUNDARY_RE.test(trimmed)) return null;
 
   try {

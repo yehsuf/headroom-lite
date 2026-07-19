@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.31.0-2] - 2026-07-19
+
+### Added
+
+- **Space-separated JSON sequence minification** — `minifyJson()` now handles whitespace-delimited JSON object sequences such as `{"id":1} {"id":2}` (common in SerpAPI/Tavily tool results). Previously `JSON.parse` failed on these and 0% compression was applied. Fix: on `JSON.parse` failure, falls through to `minifyJsonSequence()` which strips internal whitespace from each object in the sequence and rejoins with a single space. Lossless (ports upstream headroom GH #1742). Works for sequences of any count ≥2 — not subject to the >9-item array gate in Phase 2 CSV compaction.
+
 ## [0.31.0-1] - 2026-07-17
 
 ### Added
