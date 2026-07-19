@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.31.0-5] - 2026-07-19
+
+### Fixed
+
+- **Aggregate tool-output size floor: small outputs now compress in large batches** — `compactToolOutputs` previously skipped every tool_result block whose JSON array had ≤ 9 items (`MIN_ITEMS`), even when the message's total tool output was hundreds of kilobytes. Codex and similar agents emit many small individual tool results that each fall below the gate yet are large in aggregate. Fix: before processing each message, the total character length of all tool output text is computed. When the aggregate reaches or exceeds `AGGREGATE_FLOOR_CHARS` (2000), the per-block item minimum drops to 0 so every non-empty block is attempted. Object arrays (CSV-schema path via `tryObjectArrayToCsv`) benefit at any size ≥ 1 (savings-ratio check is the real gatekeeper); string/number arrays still require enough items for a head+tail omission to produce savings. `compactJsonArray` also accepts an explicit `options.minItems` override for fine-grained caller control. Ports upstream headroom GH #2050/#2116.
+
 ## [0.31.0-4] - 2026-07-19
 
 ### Fixed
