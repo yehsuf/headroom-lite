@@ -183,14 +183,18 @@ function countPointers(messages) {
 }
 
 describe('compression pipeline', () => {
-  it('skips adaptive sizing at the cap boundary and falls back to protecting five recent items', () => {
+  it('with protect_recent=0, all duplicate historical messages become dedup pointers', () => {
     const canonicalText = compactMessageText(DUPLICATE_HISTORY_BLOCK);
     const belowBoundary = compressMessages(makeRepeatedHistory(9)).messages.slice(0, -1);
     const atBoundary = compressMessages(makeRepeatedHistory(10)).messages.slice(0, -1);
 
-    assert.equal(countCanonicalMessages(belowBoundary, canonicalText), 3);
-    assert.equal(countPointers(belowBoundary), 6);
-    assert.equal(countCanonicalMessages(atBoundary, canonicalText), 6);
-    assert.equal(countPointers(atBoundary), 4);
+    // protect_recent=0: only the first occurrence is canonical; all duplicates become pointers.
+    // Previously (protect_recent=2/adaptive), recent turns were shielded from dedup.
+    // Now the sidecar is maximally aggressive — agent-level tools (e.g. myelin-compact)
+    // decide which context to preserve at a higher level (#2145).
+    assert.equal(countCanonicalMessages(belowBoundary, canonicalText), 1);
+    assert.equal(countPointers(belowBoundary), 8);
+    assert.equal(countCanonicalMessages(atBoundary, canonicalText), 1);
+    assert.equal(countPointers(atBoundary), 9);
   });
 });

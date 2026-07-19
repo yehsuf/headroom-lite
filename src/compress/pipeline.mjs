@@ -49,9 +49,13 @@ const SAFE_TEXT_KEYS = new Set([
 // corpus (~19KB per item), the slow path was already ~0.45s at 9-10 items and
 // crossed ~0.50s by 12 items, so counts >= 10 stay on the fixed fallback.
 const MAX_ADAPTIVE_SIZER_ITEMS = 10;
-const PROTECT_RECENT_AT_MEDIUM = 1;
-const MIN_ADAPTIVE_RECENT = 2;
-const MAX_ADAPTIVE_RECENT = 5;
+// protect_recent = 0: every historical message is eligible for cross-turn dedup.
+// Agent-level session managers (e.g. myelin-compact) handle which context to
+// preserve; the compression sidecar should not second-guess that by shielding
+// recent turns. Aligns with upstream headroom coding-profile default (#2145).
+const PROTECT_RECENT_AT_MEDIUM = 0;
+const MIN_ADAPTIVE_RECENT = 0;
+const MAX_ADAPTIVE_RECENT = 0;
 
 function normalizeRole(value) {
   return typeof value === 'string' ? value.toLowerCase() : 'unknown';
@@ -225,6 +229,12 @@ function groupMessageTexts(leaves) {
 }
 
 function chooseProtectedHistoricalMessages(candidates, latestMessageIndex) {
+  // protect_recent=0: all constants are 0, so this function always returns an
+  // empty set. Early exit to skip the adaptive-sizer computation.
+  if (PROTECT_RECENT_AT_MEDIUM === 0 && MIN_ADAPTIVE_RECENT === 0 && MAX_ADAPTIVE_RECENT === 0) {
+    return new Set();
+  }
+
   const historicalEntries = groupMessageTexts(candidates)
     .filter(({ messageIndex }) => messageIndex !== latestMessageIndex);
 
@@ -243,11 +253,13 @@ function chooseProtectedHistoricalMessages(candidates, latestMessageIndex) {
     }
   }
 
-  return new Set(
-    historicalEntries
-      .slice(-protectRecentCount)
-      .map(({ messageIndex }) => messageIndex),
-  );
+  return protectRecentCount <= 0
+    ? new Set()
+    : new Set(
+        historicalEntries
+          .slice(-protectRecentCount)
+          .map(({ messageIndex }) => messageIndex),
+      );
 }
 
 export function compressMessages(messages, { format = 'anthropic', model = 'default', compressLive = false } = {}) {

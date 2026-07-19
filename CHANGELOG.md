@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.31.0-4] - 2026-07-19
+
+### Fixed
+
+- **Guard lossless diff fold to diff-shaped content only** — `compactLossless(content, 'diff')` stripped `index <hex>..<hex>` bookkeeping lines from ANY content whose kind was set to `'diff'`, including arbitrary log and text payloads that happened to contain such a line. Those lines were deleted with no CCR marker, making them unrecoverable — a lossless invariant violation. Fix: added internal guard inside the `diff` branch requiring three unified-diff markers (all multiline): `index <hex>..<hex>`, `@@ ... @@` hunk header (without `$` anchor so function-name suffixes match), and `---`/`+++` source/target headers. Content lacking any marker is returned unchanged. Ports upstream headroom GH #2140.
+
+- **`protect_recent=0`: cross-turn dedup now applies to all historical messages** — previously `PROTECT_RECENT_AT_MEDIUM=1`/`MIN_ADAPTIVE_RECENT=2`/`MAX_ADAPTIVE_RECENT=5` shielded the most recent 1–5 historical messages from cross-turn deduplication. With agent-level session managers (e.g. myelin-compact) handling context preservation, the compression sidecar should be maximally aggressive. All three constants set to 0; added `protectRecentCount <= 0` short-circuit guard before `slice(-N)` to avoid `slice(-0)` bug. Aligns with upstream headroom coding-profile default GH #2145.
+
 ## [0.31.0-3] - 2026-07-19
 
 ### Fixed
