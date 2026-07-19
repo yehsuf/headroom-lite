@@ -235,6 +235,19 @@ export function compactLossless(content, kind) {
     }
 
     if (kind === 'diff') {
+      // Guard: only strip diff index lines from content that genuinely looks
+      // like a unified diff. Three markers must all be present (multiline
+      // match) before running diffStripIndex:
+      //   1. index <hex>..<hex> — the bookkeeping line we want to strip
+      //   2. @@ ... @@ — a hunk header
+      //   3. --- or +++ — source/target file headers
+      // Without this guard, arbitrary text/log payloads that happen to
+      // contain an `index a..b` line lose it with no CCR marker
+      // (unrecoverable lossless violation).
+      // Ports upstream headroom fix(transforms) GH #2140.
+      if (!/^index [0-9a-fA-F]+\.\.[0-9a-fA-F]+/m.test(content)) return content;
+      if (!/^@@ .* @@/m.test(content)) return content;
+      if (!/^(?:---|\+\+\+) /m.test(content)) return content;
       const candidate = diffStripIndex(content);
       return savesTokens(candidate, content) ? candidate : content;
     }
