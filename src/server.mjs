@@ -755,6 +755,7 @@ async function routeRequest(request, response, options) {
     writeJson(response, 200, {
       status: 'ok',
       service: 'headroom-lite',
+      version: options.version ?? null,
       schema_version: telemetrySnapshot.schema_version,
       mode: anyUpstream ? 'proxy+deterministic' : 'deterministic',
       max_body_bytes: options.maxBodyBytes,
@@ -925,6 +926,7 @@ export function createServer({
   statsPathInput = process.env.HEADROOM_LITE_STATS_PATH,
   statsMaxPointsInput = process.env.HEADROOM_LITE_STATS_MAX_POINTS,
   statsMaxAgeDaysInput = process.env.HEADROOM_LITE_STATS_MAX_AGE_DAYS,
+  version = null,
 } = {}) {
   const resolvedUpstreams = upstreams ?? {
     legacy: upstream,
@@ -953,6 +955,7 @@ export function createServer({
       telemetryLedger: resolvedTelemetryLedger,
       telemetryState,
       statsState,
+      version,
     }).catch((error) => {
       if (response.headersSent || response.writableEnded || response.destroyed) {
         if (!response.destroyed && !response.writableEnded) {
@@ -1023,6 +1026,7 @@ export function startServer({
   statsPathInput = process.env.HEADROOM_LITE_STATS_PATH,
   statsMaxPointsInput = process.env.HEADROOM_LITE_STATS_MAX_POINTS,
   statsMaxAgeDaysInput = process.env.HEADROOM_LITE_STATS_MAX_AGE_DAYS,
+  version = null,
 } = {}) {
   let resolvedUpstreams;
   if (upstreams !== undefined) {
@@ -1048,6 +1052,7 @@ export function startServer({
     lossyConfig,
     minTokens,
     telemetryLedger: resolvedTelemetryLedger,
+    version,
   });
 
   return new Promise((resolve, reject) => {

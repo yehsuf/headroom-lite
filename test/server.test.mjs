@@ -293,6 +293,7 @@ describe('HTTP server', () => {
     assert.deepEqual(await health.json(), {
       status: 'ok',
       service: 'headroom-lite',
+      version: null,
       schema_version: 1,
       mode: 'deterministic',
       max_body_bytes: 1024 * 1024,

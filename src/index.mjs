@@ -27,7 +27,7 @@ if (cliArgs.includes('--help') || cliArgs.includes('-h')) {
 
 const host = process.env.HEADROOM_LITE_HOST ?? DEFAULT_HOST;
 
-const server = await startServer({ host });
+const server = await startServer({ host, version });
 const address = server.address();
 const port = typeof address === 'object' && address !== null ? address.port : 'unknown';
 
