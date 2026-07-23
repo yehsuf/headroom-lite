@@ -17,6 +17,7 @@ import { parseIntOption } from './lib/config.mjs';
 import { IMPLEMENTATION_NAME, IMPLEMENTATION_HEADER } from './lib/identity.mjs';
 import { compressMessages } from './compress/pipeline.mjs';
 import { detectFormat } from './providers/detect.mjs';
+import { normalizeOpenAIParams } from './normalize/openai-params.mjs';
 
 // RFC 7230 §6.1 — fixed set of hop-by-hop headers that must not be forwarded.
 // The Connection header value may also name additional hop-by-hop headers;
@@ -268,8 +269,10 @@ export async function proxyCompressedRequest(inboundReq, inboundRes, {
         if (parsed && typeof parsed === 'object' && Array.isArray(parsed.messages)) {
           const inboundParsed = new URL(inboundReq.url ?? '/', 'http://placeholder');
           const format = detectFormat(inboundParsed.pathname);
-          const { messages } = compressMessages(parsed.messages, { format, compressLive });
-          const compressed = Buffer.from(JSON.stringify({ ...parsed, messages }), 'utf8');
+          let normalized = parsed;
+          if (format === 'openai') normalized = normalizeOpenAIParams(parsed);
+          const { messages } = compressMessages(normalized.messages, { format, compressLive });
+          const compressed = Buffer.from(JSON.stringify({ ...normalized, messages }), 'utf8');
           proxyRequest(inboundReq, inboundRes, { upstream, timeoutMs, body: compressed });
           return;
         }
