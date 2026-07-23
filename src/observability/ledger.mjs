@@ -29,7 +29,7 @@ const HISTORY_SERIES = Object.freeze([
   'proxy.requests',
   'proxy.latency_ms',
 ]);
-const COMPRESSION_EVENT_KEYS = new Set(['tokensBefore', 'tokensAfter', 'latencyMs', 'outcome', 'provider', 'model']);
+const COMPRESSION_EVENT_KEYS = new Set(['tokensBefore', 'tokensAfter', 'cacheWritePremiumTokens', 'latencyMs', 'outcome', 'provider', 'model']);
 const PROXY_EVENT_KEYS = new Set(['latencyMs', 'outcome', 'provider', 'model']);
 // Persisted/exported label dimensions must never echo raw request-derived strings.
 // Collapse them into a finite safe vocabulary so paths, IDs, auth material, bodies,
@@ -67,6 +67,7 @@ function createAggregate() {
       tokens_before: 0,
       tokens_after: 0,
       tokens_saved: 0,
+      cache_write_premium_tokens: 0,
       latency_ms: 0,
       outcomes: {},
       providers: {},
@@ -139,6 +140,7 @@ function cloneAggregate(source = createAggregate()) {
   aggregate.compression.tokens_before = normalizeNumber(compression.tokens_before);
   aggregate.compression.tokens_after = normalizeNumber(compression.tokens_after);
   aggregate.compression.tokens_saved = normalizeNumber(compression.tokens_saved);
+  aggregate.compression.cache_write_premium_tokens = normalizeNumber(compression.cache_write_premium_tokens);
   aggregate.compression.latency_ms = normalizeNumber(compression.latency_ms);
   aggregate.compression.outcomes = normalizeCountMap(compression.outcomes, normalizeOutcomeLabel);
   aggregate.compression.providers = normalizeCountMap(compression.providers, normalizeProviderLabel);
@@ -165,6 +167,7 @@ function addAggregate(target, delta) {
   target.compression.tokens_before += normalizeNumber(delta?.compression?.tokens_before);
   target.compression.tokens_after += normalizeNumber(delta?.compression?.tokens_after);
   target.compression.tokens_saved += normalizeNumber(delta?.compression?.tokens_saved);
+  target.compression.cache_write_premium_tokens += normalizeNumber(delta?.compression?.cache_write_premium_tokens);
   target.compression.latency_ms += normalizeNumber(delta?.compression?.latency_ms);
   addCountMap(target.compression.outcomes, delta?.compression?.outcomes);
   addCountMap(target.compression.providers, delta?.compression?.providers);
@@ -198,6 +201,7 @@ function diffAggregate(current, previous = createAggregate()) {
       tokens_before: Math.max(0, normalizeNumber(current?.compression?.tokens_before) - normalizeNumber(previous?.compression?.tokens_before)),
       tokens_after: Math.max(0, normalizeNumber(current?.compression?.tokens_after) - normalizeNumber(previous?.compression?.tokens_after)),
       tokens_saved: Math.max(0, normalizeNumber(current?.compression?.tokens_saved) - normalizeNumber(previous?.compression?.tokens_saved)),
+      cache_write_premium_tokens: Math.max(0, normalizeNumber(current?.compression?.cache_write_premium_tokens) - normalizeNumber(previous?.compression?.cache_write_premium_tokens)),
       latency_ms: Math.max(0, normalizeNumber(current?.compression?.latency_ms) - normalizeNumber(previous?.compression?.latency_ms)),
       outcomes: diffCountMap(current?.compression?.outcomes, previous?.compression?.outcomes),
       providers: diffCountMap(current?.compression?.providers, previous?.compression?.providers),
@@ -253,14 +257,19 @@ function recordCompressionInState(state, event) {
   assertAllowedEventKeys(event, COMPRESSION_EVENT_KEYS);
   const tokensBefore = normalizeNumber(event.tokensBefore);
   const tokensAfter = normalizeNumber(event.tokensAfter);
+  const cacheWritePremiumTokens = normalizeNumber(event.cacheWritePremiumTokens);
   const latencyMs = normalizeNumber(event.latencyMs);
-  const tokensSaved = Math.max(0, tokensBefore - tokensAfter);
+  // Subtract cache write premiums from net savings — cache writes cost extra tokens
+  // (e.g. Anthropic charges 25% on top for the first write) so gross savings overstate
+  // the true benefit when prompt caching is active. Ref: fix(proxy) GH #1800.
+  const tokensSaved = Math.max(0, tokensBefore - tokensAfter - cacheWritePremiumTokens);
 
   for (const aggregate of [state.lifetime, state.session]) {
     aggregate.compression.requests += 1;
     aggregate.compression.tokens_before += tokensBefore;
     aggregate.compression.tokens_after += tokensAfter;
     aggregate.compression.tokens_saved += tokensSaved;
+    aggregate.compression.cache_write_premium_tokens += cacheWritePremiumTokens;
     aggregate.compression.latency_ms += latencyMs;
     addDimensionCount(aggregate.compression.outcomes, event.outcome, normalizeOutcomeLabel);
     addDimensionCount(aggregate.compression.providers, event.provider, normalizeProviderLabel);
@@ -292,14 +301,16 @@ function snapshotToPrometheus(snapshot) {
     ['headroom_lite_lifetime_compression_requests_total', 'counter', 'lifetime compression requests total', snapshot.lifetime.compression.requests],
     ['headroom_lite_lifetime_compression_tokens_before_total', 'counter', 'lifetime compression tokens before total', snapshot.lifetime.compression.tokens_before],
     ['headroom_lite_lifetime_compression_tokens_after_total', 'counter', 'lifetime compression tokens after total', snapshot.lifetime.compression.tokens_after],
-    ['headroom_lite_lifetime_compression_tokens_saved_total', 'counter', 'lifetime compression tokens saved total', snapshot.lifetime.compression.tokens_saved],
+    ['headroom_lite_lifetime_compression_tokens_saved_total', 'counter', 'lifetime compression tokens saved (net, after cache write premiums) total', snapshot.lifetime.compression.tokens_saved],
+    ['headroom_lite_lifetime_compression_cache_write_premium_tokens_total', 'counter', 'lifetime cache write premium tokens total', snapshot.lifetime.compression.cache_write_premium_tokens],
     ['headroom_lite_lifetime_compression_latency_ms_total', 'counter', 'lifetime compression latency milliseconds total', snapshot.lifetime.compression.latency_ms],
     ['headroom_lite_lifetime_proxy_requests_total', 'counter', 'lifetime proxy requests total', snapshot.lifetime.proxy.requests],
     ['headroom_lite_lifetime_proxy_latency_ms_total', 'counter', 'lifetime proxy latency milliseconds total', snapshot.lifetime.proxy.latency_ms],
     ['headroom_lite_session_compression_requests_total', 'counter', 'session compression requests total', snapshot.session.compression.requests],
     ['headroom_lite_session_compression_tokens_before_total', 'counter', 'session compression tokens before total', snapshot.session.compression.tokens_before],
     ['headroom_lite_session_compression_tokens_after_total', 'counter', 'session compression tokens after total', snapshot.session.compression.tokens_after],
-    ['headroom_lite_session_compression_tokens_saved_total', 'counter', 'session compression tokens saved total', snapshot.session.compression.tokens_saved],
+    ['headroom_lite_session_compression_tokens_saved_total', 'counter', 'session compression tokens saved (net, after cache write premiums) total', snapshot.session.compression.tokens_saved],
+    ['headroom_lite_session_compression_cache_write_premium_tokens_total', 'counter', 'session cache write premium tokens total', snapshot.session.compression.cache_write_premium_tokens],
     ['headroom_lite_session_compression_latency_ms_total', 'counter', 'session compression latency milliseconds total', snapshot.session.compression.latency_ms],
     ['headroom_lite_session_proxy_requests_total', 'counter', 'session proxy requests total', snapshot.session.proxy.requests],
     ['headroom_lite_session_proxy_latency_ms_total', 'counter', 'session proxy latency milliseconds total', snapshot.session.proxy.latency_ms],

@@ -427,6 +427,35 @@ describe('telemetry ledger', () => {
     assert.equal(stats.lifetime.proxy.latency_ms, 0);
   });
 
+  it('subtracts cacheWritePremiumTokens from tokens_saved (HLITE-B5-COST-001)', () => {
+    const ledger = createTelemetryLedger({ path: ledgerPath() });
+    // 100 tokens before, 40 after = 60 gross savings. But 10 cache write premium tokens.
+    // Net tokens_saved = 60 - 10 = 50.
+    ledger.recordCompression({ tokensBefore: 100, tokensAfter: 40, cacheWritePremiumTokens: 10, latencyMs: 5 });
+    const stats = ledger.snapshot();
+    assert.equal(stats.lifetime.compression.tokens_saved, 50, 'net savings = gross - premium');
+    assert.equal(stats.lifetime.compression.cache_write_premium_tokens, 10);
+    assert.equal(stats.session.compression.tokens_saved, 50);
+    assert.equal(stats.session.compression.cache_write_premium_tokens, 10);
+  });
+
+  it('tokens_saved floors at 0 when premium exceeds gross savings', () => {
+    const ledger = createTelemetryLedger({ path: ledgerPath() });
+    // 100 before, 80 after = 20 gross savings. Premium = 30 → net cannot go negative.
+    ledger.recordCompression({ tokensBefore: 100, tokensAfter: 80, cacheWritePremiumTokens: 30, latencyMs: 5 });
+    const stats = ledger.snapshot();
+    assert.equal(stats.lifetime.compression.tokens_saved, 0, 'clamped at 0');
+    assert.equal(stats.lifetime.compression.cache_write_premium_tokens, 30);
+  });
+
+  it('cacheWritePremiumTokens defaults to 0 when omitted (backward compat)', () => {
+    const ledger = createTelemetryLedger({ path: ledgerPath() });
+    ledger.recordCompression({ tokensBefore: 100, tokensAfter: 40, latencyMs: 5 });
+    const stats = ledger.snapshot();
+    assert.equal(stats.lifetime.compression.tokens_saved, 60, 'no premium = full gross savings');
+    assert.equal(stats.lifetime.compression.cache_write_premium_tokens, 0);
+  });
+
   it('persists validated lifetime state across restart while resetting session counters', () => {
     const path = ledgerPath('persisted.json');
     const firstClock = createClock('2026-01-01T00:00:00.000Z');
