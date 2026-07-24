@@ -570,6 +570,7 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
     tokensAfter: 0,
     provider: undefined,
     model: undefined,
+    cacheDriftStatus: undefined,
   };
   response.once('finish', () => {
     let outcome = 'ok';
@@ -581,6 +582,7 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
       telemetryLedger.recordCompression?.({
         tokensBefore: telemetryEvent.tokensBefore,
         tokensAfter: telemetryEvent.tokensAfter,
+        cacheDriftStatus: telemetryEvent.cacheDriftStatus,
         latencyMs,
         outcome,
         provider: telemetryEvent.provider,
@@ -734,6 +736,8 @@ async function handleCompress(request, response, { maxBodyBytes, compressLive, l
       messages: payload.messages,
     });
     responseBody.cache_drift = driftInfo;
+    // Surface drift status in telemetry for provider-agnostic cache consistency metrics
+    telemetryEvent.cacheDriftStatus = driftInfo?.status ?? null;
   }
 
   telemetryEvent.tokensBefore = tokensBefore;

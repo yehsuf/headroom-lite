@@ -29,12 +29,14 @@ const HISTORY_SERIES = Object.freeze([
   'proxy.requests',
   'proxy.latency_ms',
 ]);
-const COMPRESSION_EVENT_KEYS = new Set(['tokensBefore', 'tokensAfter', 'cacheWritePremiumTokens', 'latencyMs', 'outcome', 'provider', 'model']);
+const COMPRESSION_EVENT_KEYS = new Set(['tokensBefore', 'tokensAfter', 'cacheWritePremiumTokens', 'cacheDriftStatus', 'latencyMs', 'outcome', 'provider', 'model']);
 const PROXY_EVENT_KEYS = new Set(['latencyMs', 'outcome', 'provider', 'model']);
 // Persisted/exported label dimensions must never echo raw request-derived strings.
 // Collapse them into a finite safe vocabulary so paths, IDs, auth material, bodies,
 // and responses cannot be written to disk or exposed via snapshot/Prometheus output.
 const SAFE_OUTCOME_LABELS = new Set(['ok', 'error', 'timeout', 'rejected', 'cancelled']);
+// Valid cache drift statuses (from DriftDetector: 'first' | 'stable' | 'drifted' | null/undefined → skipped)
+const SAFE_CACHE_DRIFT_STATUSES = new Set(['first', 'stable', 'drifted']);
 const SAFE_PROVIDER_LABELS = new Set(['anthropic', 'openai', 'github-models']);
 const SAFE_MODEL_FAMILIES = Object.freeze([
   ['claude', 'claude'],
@@ -69,6 +71,9 @@ function createAggregate() {
       tokens_saved: 0,
       cache_write_premium_tokens: 0,
       latency_ms: 0,
+      cache_stable: 0,
+      cache_drifted: 0,
+      cache_first: 0,
       outcomes: {},
       providers: {},
       models: {},
@@ -141,6 +146,9 @@ function cloneAggregate(source = createAggregate()) {
   aggregate.compression.tokens_after = normalizeNumber(compression.tokens_after);
   aggregate.compression.tokens_saved = normalizeNumber(compression.tokens_saved);
   aggregate.compression.cache_write_premium_tokens = normalizeNumber(compression.cache_write_premium_tokens);
+  aggregate.compression.cache_stable = normalizeNumber(compression.cache_stable);
+  aggregate.compression.cache_drifted = normalizeNumber(compression.cache_drifted);
+  aggregate.compression.cache_first = normalizeNumber(compression.cache_first);
   aggregate.compression.latency_ms = normalizeNumber(compression.latency_ms);
   aggregate.compression.outcomes = normalizeCountMap(compression.outcomes, normalizeOutcomeLabel);
   aggregate.compression.providers = normalizeCountMap(compression.providers, normalizeProviderLabel);
@@ -168,6 +176,9 @@ function addAggregate(target, delta) {
   target.compression.tokens_after += normalizeNumber(delta?.compression?.tokens_after);
   target.compression.tokens_saved += normalizeNumber(delta?.compression?.tokens_saved);
   target.compression.cache_write_premium_tokens += normalizeNumber(delta?.compression?.cache_write_premium_tokens);
+  target.compression.cache_stable += normalizeNumber(delta?.compression?.cache_stable);
+  target.compression.cache_drifted += normalizeNumber(delta?.compression?.cache_drifted);
+  target.compression.cache_first += normalizeNumber(delta?.compression?.cache_first);
   target.compression.latency_ms += normalizeNumber(delta?.compression?.latency_ms);
   addCountMap(target.compression.outcomes, delta?.compression?.outcomes);
   addCountMap(target.compression.providers, delta?.compression?.providers);
@@ -202,6 +213,9 @@ function diffAggregate(current, previous = createAggregate()) {
       tokens_after: Math.max(0, normalizeNumber(current?.compression?.tokens_after) - normalizeNumber(previous?.compression?.tokens_after)),
       tokens_saved: Math.max(0, normalizeNumber(current?.compression?.tokens_saved) - normalizeNumber(previous?.compression?.tokens_saved)),
       cache_write_premium_tokens: Math.max(0, normalizeNumber(current?.compression?.cache_write_premium_tokens) - normalizeNumber(previous?.compression?.cache_write_premium_tokens)),
+      cache_stable: Math.max(0, normalizeNumber(current?.compression?.cache_stable) - normalizeNumber(previous?.compression?.cache_stable)),
+      cache_drifted: Math.max(0, normalizeNumber(current?.compression?.cache_drifted) - normalizeNumber(previous?.compression?.cache_drifted)),
+      cache_first: Math.max(0, normalizeNumber(current?.compression?.cache_first) - normalizeNumber(previous?.compression?.cache_first)),
       latency_ms: Math.max(0, normalizeNumber(current?.compression?.latency_ms) - normalizeNumber(previous?.compression?.latency_ms)),
       outcomes: diffCountMap(current?.compression?.outcomes, previous?.compression?.outcomes),
       providers: diffCountMap(current?.compression?.providers, previous?.compression?.providers),
@@ -263,6 +277,10 @@ function recordCompressionInState(state, event) {
   // (e.g. Anthropic charges 25% on top for the first write) so gross savings overstate
   // the true benefit when prompt caching is active. Ref: fix(proxy) GH #1800.
   const tokensSaved = Math.max(0, tokensBefore - tokensAfter - cacheWritePremiumTokens);
+  // cacheDriftStatus: 'stable' | 'drifted' | 'first' — from DriftDetector.check().
+  // Tracks cross-provider cache consistency: how often the compressed cache prefix
+  // stays stable between requests. Unknown/absent = not counted (session_id not provided).
+  const cacheDrift = SAFE_CACHE_DRIFT_STATUSES.has(event.cacheDriftStatus) ? event.cacheDriftStatus : null;
 
   for (const aggregate of [state.lifetime, state.session]) {
     aggregate.compression.requests += 1;
@@ -271,6 +289,9 @@ function recordCompressionInState(state, event) {
     aggregate.compression.tokens_saved += tokensSaved;
     aggregate.compression.cache_write_premium_tokens += cacheWritePremiumTokens;
     aggregate.compression.latency_ms += latencyMs;
+    if (cacheDrift === 'stable')  aggregate.compression.cache_stable  += 1;
+    if (cacheDrift === 'drifted') aggregate.compression.cache_drifted += 1;
+    if (cacheDrift === 'first')   aggregate.compression.cache_first   += 1;
     addDimensionCount(aggregate.compression.outcomes, event.outcome, normalizeOutcomeLabel);
     addDimensionCount(aggregate.compression.providers, event.provider, normalizeProviderLabel);
     addDimensionCount(aggregate.compression.models, event.model, normalizeModelLabel);
@@ -303,6 +324,9 @@ function snapshotToPrometheus(snapshot) {
     ['headroom_lite_lifetime_compression_tokens_after_total', 'counter', 'lifetime compression tokens after total', snapshot.lifetime.compression.tokens_after],
     ['headroom_lite_lifetime_compression_tokens_saved_total', 'counter', 'lifetime compression tokens saved (net, after cache write premiums) total', snapshot.lifetime.compression.tokens_saved],
     ['headroom_lite_lifetime_compression_cache_write_premium_tokens_total', 'counter', 'lifetime cache write premium tokens total', snapshot.lifetime.compression.cache_write_premium_tokens],
+    ['headroom_lite_lifetime_compression_cache_stable_total', 'counter', 'lifetime requests with stable cache prefix (provider-agnostic)', snapshot.lifetime.compression.cache_stable],
+    ['headroom_lite_lifetime_compression_cache_drifted_total', 'counter', 'lifetime requests where cache prefix drifted (busted)', snapshot.lifetime.compression.cache_drifted],
+    ['headroom_lite_lifetime_compression_cache_first_total', 'counter', 'lifetime first-seen requests per session (no prior cache baseline)', snapshot.lifetime.compression.cache_first],
     ['headroom_lite_lifetime_compression_latency_ms_total', 'counter', 'lifetime compression latency milliseconds total', snapshot.lifetime.compression.latency_ms],
     ['headroom_lite_lifetime_proxy_requests_total', 'counter', 'lifetime proxy requests total', snapshot.lifetime.proxy.requests],
     ['headroom_lite_lifetime_proxy_latency_ms_total', 'counter', 'lifetime proxy latency milliseconds total', snapshot.lifetime.proxy.latency_ms],
@@ -311,6 +335,9 @@ function snapshotToPrometheus(snapshot) {
     ['headroom_lite_session_compression_tokens_after_total', 'counter', 'session compression tokens after total', snapshot.session.compression.tokens_after],
     ['headroom_lite_session_compression_tokens_saved_total', 'counter', 'session compression tokens saved (net, after cache write premiums) total', snapshot.session.compression.tokens_saved],
     ['headroom_lite_session_compression_cache_write_premium_tokens_total', 'counter', 'session cache write premium tokens total', snapshot.session.compression.cache_write_premium_tokens],
+    ['headroom_lite_session_compression_cache_stable_total', 'counter', 'session requests with stable cache prefix (provider-agnostic)', snapshot.session.compression.cache_stable],
+    ['headroom_lite_session_compression_cache_drifted_total', 'counter', 'session requests where cache prefix drifted (busted)', snapshot.session.compression.cache_drifted],
+    ['headroom_lite_session_compression_cache_first_total', 'counter', 'session first-seen requests per session (no prior cache baseline)', snapshot.session.compression.cache_first],
     ['headroom_lite_session_compression_latency_ms_total', 'counter', 'session compression latency milliseconds total', snapshot.session.compression.latency_ms],
     ['headroom_lite_session_proxy_requests_total', 'counter', 'session proxy requests total', snapshot.session.proxy.requests],
     ['headroom_lite_session_proxy_latency_ms_total', 'counter', 'session proxy latency milliseconds total', snapshot.session.proxy.latency_ms],

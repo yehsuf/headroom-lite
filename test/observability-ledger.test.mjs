@@ -456,6 +456,35 @@ describe('telemetry ledger', () => {
     assert.equal(stats.lifetime.compression.cache_write_premium_tokens, 0);
   });
 
+  it('records cache drift consistency metrics (HLITE-B6-CACHE-001)', () => {
+    const ledger = createTelemetryLedger({ path: ledgerPath() });
+    ledger.recordCompression({ tokensBefore: 100, tokensAfter: 40, cacheDriftStatus: 'first', latencyMs: 5 });
+    ledger.recordCompression({ tokensBefore: 100, tokensAfter: 40, cacheDriftStatus: 'stable', latencyMs: 5 });
+    ledger.recordCompression({ tokensBefore: 100, tokensAfter: 40, cacheDriftStatus: 'stable', latencyMs: 5 });
+    ledger.recordCompression({ tokensBefore: 100, tokensAfter: 40, cacheDriftStatus: 'drifted', latencyMs: 5 });
+    const stats = ledger.snapshot();
+    assert.equal(stats.lifetime.compression.cache_first, 1);
+    assert.equal(stats.lifetime.compression.cache_stable, 2);
+    assert.equal(stats.lifetime.compression.cache_drifted, 1);
+    assert.equal(stats.lifetime.compression.requests, 4);
+  });
+
+  it('cache drift counters default to 0 when cacheDriftStatus is omitted (backward compat)', () => {
+    const ledger = createTelemetryLedger({ path: ledgerPath() });
+    ledger.recordCompression({ tokensBefore: 100, tokensAfter: 40, latencyMs: 5 });
+    const stats = ledger.snapshot();
+    assert.equal(stats.lifetime.compression.cache_stable, 0);
+    assert.equal(stats.lifetime.compression.cache_drifted, 0);
+    assert.equal(stats.lifetime.compression.cache_first, 0);
+  });
+
+  it('ignores unknown cacheDriftStatus values (safe vocabulary enforcement)', () => {
+    const ledger = createTelemetryLedger({ path: ledgerPath() });
+    ledger.recordCompression({ tokensBefore: 100, tokensAfter: 40, cacheDriftStatus: 'INJECTED', latencyMs: 5 });
+    const stats = ledger.snapshot();
+    assert.equal(stats.lifetime.compression.cache_stable + stats.lifetime.compression.cache_drifted + stats.lifetime.compression.cache_first, 0);
+  });
+
   it('persists validated lifetime state across restart while resetting session counters', () => {
     const path = ledgerPath('persisted.json');
     const firstClock = createClock('2026-01-01T00:00:00.000Z');
